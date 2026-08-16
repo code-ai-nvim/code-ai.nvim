@@ -6,6 +6,8 @@ local query = {}
 -- Normalize a "gemini-3.[567]-flash" model name that may carry a thinking-level suffix
 -- (e.g. "gemini-3.5-flash-minimal", "gemini-3.6-flash-medium", "gemini-3.7-flash-high").
 -- Mirrors the logic implemented in code-ai-agent/googleai-agent/src/main.ts
+-- The returned `model` field is also the bare model id used to build the
+-- `:generateContent` REST endpoint URL.
 local function normalizeGeminiFlashModel(model)
   local version, level
 
@@ -28,65 +30,79 @@ local function normalizeGeminiFlashModel(model)
 end
 
 -- Map an ordered conversation ({ role = "user"|"assistant", content = "..." })
--- into GoogleAI's Step[] shape, mirroring googleai-agent's buildRequestBody():
---   role="user"      -> { type = "user_input",  content = [{ type = "text", text = ... }] }
---   role="assistant" -> { type = "model_output", content = [{ type = "text", text = ... }] }
-local function messagesToSteps(messages)
-  local steps = {}
+-- into the `generateContent` REST API's Content[] shape, mirroring
+-- googleai-agent's buildRequestBody():
+--   role="user"      -> { role = "user",  parts = [{ text = ... }] }
+--   role="assistant" -> { role = "model", parts = [{ text = ... }] }
+local function messagesToContents(messages)
+  local contents = {}
   for _, message in ipairs(messages or {}) do
-    local step_type = (message.role == 'user') and 'user_input' or 'model_output'
-    table.insert(steps, {
-      type = step_type,
-      content = { { type = 'text', text = message.content } },
+    local role = (message.role == 'user') and 'user' or 'model'
+    table.insert(contents, {
+      role = role,
+      parts = { { text = message.content } },
     })
   end
-  return steps
+  return contents
 end
 
 local googleai_runner = provider.createQueryRunner({
   name = "GoogleAI",
   title_tag = "GGL",
   history_prefix = "googleai_",
-  api_host = 'https://generativelanguage.googleapis.com',
-  api_path = '/v1beta/interactions',
+  api_host = 'https://aiplatform.googleapis.com',
   disabled_response = {
-    steps = { { type = "model_output", content = { { text = "GoogleAI models are disabled" } } } },
-    usage = { total_input_tokens = 0, total_output_tokens = 0 }
+    candidates = { { content = { role = "model", parts = { { text = "GoogleAI models are disabled" } } } } },
+    usageMetadata = { promptTokenCount = 0, candidatesTokenCount = 0 }
   },
-  build_headers = function(api_key)
+  -- The `generateContent` method authenticates via the `key` query parameter
+  -- (see build_url below), so no API-key header is needed here.
+  build_headers = function()
     return {
       ['Content-type'] = 'application/json',
-      ['x-goog-api-key'] = api_key
     }
   end,
+  -- The `generateContent` method takes the model id and the API key directly
+  -- in the URL, instead of a fixed path + header, so we build the full
+  -- request URL here rather than relying on a static `api_path`.
+  -- Mirrors: POST {api_host}/v1/publishers/google/models/{model}:generateContent?key={api_key}
+  build_url = function(api_host, api_key, model)
+    local normalized = normalizeGeminiFlashModel(model)
+    return api_host .. '/v1/publishers/google/models/' .. normalized.model .. ':generateContent?key=' .. api_key
+  end,
   -- `messages` is an ordered array of { role = "user"|"assistant", content = "..." }
-  -- built by ai.conversation.build(). We convert it to GoogleAI's Step[] input shape,
-  -- matching wire-for-wire what googleai-agent's buildRequestBody() sends today.
+  -- built by ai.conversation.build(). We convert it to the `generateContent` API's
+  -- Content[] input shape, matching wire-for-wire what googleai-agent's
+  -- buildRequestBody() sends today.
   build_request_body = function(model, instruction, messages)
     local normalized = normalizeGeminiFlashModel(model)
 
     local request_body = {
-      model = normalized.model,
-      input = messagesToSteps(messages),
-      generation_config = {
+      contents = messagesToContents(messages),
+      generationConfig = {
         temperature = 0.2,
-        top_p = 0.5
+        topP = 0.5
       }
     }
 
     if normalized.thinking_level then
-      request_body.generation_config.thinking_level = normalized.thinking_level
+      request_body.generationConfig.thinkingConfig = { thinkingLevel = normalized.thinking_level }
     end
 
     if instruction and instruction ~= '' then
-      request_body.system_instruction = instruction
+      request_body.systemInstruction = { parts = { { text = instruction } } }
     end
     return request_body
   end,
   validate_data = function(data)
-    local steps = data['steps']
-    if steps == nil or #steps == 0 then
-      if data['error'] then
+    local candidates = data['candidates']
+    if candidates == nil or #candidates == 0 then
+      if data['promptFeedback'] and data['promptFeedback']['blockReason'] then
+        local reason = data['promptFeedback']['blockReason']
+        local message = data['promptFeedback']['blockReasonMessage'] or ''
+        local details = message ~= '' and ('\n\n' .. message) or ''
+        return '\n#GoogleAI error\n\nPrompt blocked. Reason: ' .. reason .. details .. '\n'
+      elseif data['error'] then
         return '\n#GoogleAI error\n\nGoogleAI stopped with the reason: '
           .. (data['error']['message'] or 'unknown') .. '\n'
       else
@@ -94,32 +110,31 @@ local googleai_runner = provider.createQueryRunner({
       end
     end
 
-    local last_output = nil
-    for i = #steps, 1, -1 do
-      if steps[i].type == "model_output" then
-        last_output = steps[i]
-        break
-      end
-    end
-
-    if not last_output or not last_output.content or #last_output.content == 0 then
+    local first_candidate = candidates[1]
+    if not first_candidate or not first_candidate.content or not first_candidate.content.parts or #first_candidate.content.parts == 0 then
       return '\n#GoogleAI error\n\nNo model output found.\n'
     end
 
     return nil
   end,
   extract_usage = function(data)
-    local usage = data.usage or {}
-    return usage.total_input_tokens or 0, usage.total_output_tokens or 0
+    local usage = data.usageMetadata or {}
+    return usage.promptTokenCount or 0, usage.candidatesTokenCount or 0
   end,
   extract_content = function(data)
-    local steps = data['steps'] or {}
-    for i = #steps, 1, -1 do
-      if steps[i].type == "model_output" and steps[i].content and steps[i].content[1] then
-        return steps[i].content[1].text or ""
+    local candidates = data['candidates'] or {}
+    local first_candidate = candidates[1]
+    if not first_candidate or not first_candidate.content or not first_candidate.content.parts then
+      return ""
+    end
+
+    local texts = {}
+    for _, part in ipairs(first_candidate.content.parts) do
+      if part.text then
+        table.insert(texts, part.text)
       end
     end
-    return ""
+    return table.concat(texts, "")
   end,
   format_error = function(status, body)
     common.log("Formatting GoogleAI API error: " .. body)

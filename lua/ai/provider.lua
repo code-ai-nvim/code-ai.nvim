@@ -44,7 +44,11 @@ function M.createQueryRunner(config)
   --   history_prefix: string (e.g. "anthropic_", "googleai_", "openai_")
   --   disabled_response: table
   --   api_host: string
-  --   api_path: string
+  --   api_path: string (used unless build_url is provided)
+  --   build_url: function(api_host, api_key, model) -> string (optional; when
+  --     provided, overrides api_path-based URL construction, used by
+  --     providers whose REST endpoint embeds the model id and/or API key
+  --     directly in the URL, e.g. GoogleAI's `:generateContent?key=...`)
   --   build_headers: function(api_key, model) -> table
   --   build_request_body: function(model, instruction, messages) -> table
   --   extract_usage: function(data) -> input_tokens, output_tokens
@@ -218,7 +222,18 @@ function M.createQueryRunner(config)
     local request_body = config.build_request_body(model, instruction, messages)
     local headers = config.build_headers(api_key, model)
 
-    curl.post(config.api_host .. config.api_path, {
+    -- Some providers (e.g. GoogleAI's `:generateContent` method) need the
+    -- model id and/or API key embedded directly in the URL rather than a
+    -- fixed path + header. When config.build_url is provided, use it;
+    -- otherwise fall back to the historical static api_host .. api_path.
+    local url
+    if config.build_url then
+      url = config.build_url(config.api_host, api_key, model)
+    else
+      url = config.api_host .. config.api_path
+    end
+
+    curl.post(url, {
       headers = headers,
       body = vim.fn.json_encode(request_body),
       timeout = LIGHT_REQUEST_TIMEOUT_MS,
