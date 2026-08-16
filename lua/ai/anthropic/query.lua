@@ -40,7 +40,7 @@ local anthropic_runner = provider.createQueryRunner({
   api_host = 'https://api.anthropic.com',
   api_path = '/v1/messages',
   disabled_response = {
-    content = { { text = "Anthropic models are disabled" } },
+    content = { { type = "text", text = "Anthropic models are disabled" } },
     usage = { input_tokens = 0, output_tokens = 0 }
   },
   build_headers = function(api_key, model)
