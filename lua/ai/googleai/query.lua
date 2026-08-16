@@ -26,6 +26,10 @@ local function normalizeGeminiFlashModel(model)
     return { model = model }
   end
 
+  if version == '3.7' and level == 'minimal' then
+    level = 'low'
+  end
+
   return { model = 'gemini-' .. version .. '-flash', thinking_level = level }
 end
 
@@ -112,6 +116,9 @@ local googleai_runner = provider.createQueryRunner({
 
     local first_candidate = candidates[1]
     if not first_candidate or not first_candidate.content or not first_candidate.content.parts or #first_candidate.content.parts == 0 then
+      if first_candidate and first_candidate.finishReason and first_candidate.finishReason ~= 'STOP' then
+        return '\n#GoogleAI error\n\nGeneration stopped with reason: ' .. first_candidate.finishReason .. '\n'
+      end
       return '\n#GoogleAI error\n\nNo model output found.\n'
     end
 
