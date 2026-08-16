@@ -92,7 +92,7 @@ Example with `lazy.nvim`:
 
 ```lua
 {
-    'rakotomandimby/code-ai.nvim',
+    'code-ai-nvim/code-ai.nvim',
     dependencies = {
         'nvim-lua/plenary.nvim',
     },
