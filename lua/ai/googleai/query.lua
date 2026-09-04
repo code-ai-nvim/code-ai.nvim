@@ -11,14 +11,14 @@ local query = {}
 local function normalizeGeminiFlashModel(model)
   local version, level
 
-  version, level = model:match('^gemini%-(3%.[567])%-flash%-(minimal)$')
-  if not version then version, level = model:match('^gemini%-(3%.[567])%-flash%-(low)$') end
-  if not version then version, level = model:match('^gemini%-(3%.[567])%-flash%-(medium)$') end
-  if not version then version, level = model:match('^gemini%-(3%.[567])%-flash%-(high)$') end
+  version, level = model:match('^gemini%-(3%.[56789])%-flash%-(minimal)$')
+  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(low)$') end
+  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(medium)$') end
+  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(high)$') end
 
   if not version then
     -- No suffix: still normalize if it matches the base pattern, defaulting to 'low'
-    version = model:match('^gemini%-(3%.[567])%-flash$')
+    version = model:match('^gemini%-(3%.[56789])%-flash$')
     level = version and 'low' or nil
   end
 

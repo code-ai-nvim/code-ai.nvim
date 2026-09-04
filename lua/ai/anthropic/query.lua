@@ -63,7 +63,7 @@ local anthropic_runner = provider.createQueryRunner({
 
     local request_body = {
       model = normalized.model,
-      max_tokens = 64000,
+      max_tokens = 128000,
       messages = messages,
     }
 
