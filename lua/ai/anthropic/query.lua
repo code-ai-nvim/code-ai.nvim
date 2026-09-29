@@ -3,33 +3,25 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a "claude-sonnet-5" model name that may carry a suffix
--- (e.g. "claude-sonnet-5-low", "claude-sonnet-5-medium", "claude-sonnet-5-high").
--- Mirrors the logic implemented in code-ai-agent/anthropic-agent/src/main.ts,
--- including its default case: a bare "claude-sonnet-5" (no suffix) falls through
--- to the same "disable thinking" branch as the "low" suffix does, since the TS
--- switch(suffix) statement's `case 'low': default:` group also matches
--- `suffix === undefined`. Previously this Lua implementation special-cased the
--- bare "claude-sonnet-5" model and returned it without disabling thinking,
--- which let Anthropic decide on its own whether to emit a leading `thinking`
--- content block for that request in light mode (unlike heavy mode, which always
--- disables it here) - this in turn broke extract_content() below whenever the
--- first content block wasn't a `text` block, silently dropping the response body.
-local function normalizeClaudeSonnet5Model(model)
-  local suffix = model:match('^claude%-sonnet%-5%-(.+)$')
+-- Normalize a model name that may carry a trailing suffix.
+-- Examples:
+--   "xxxxxxxxxx-yyy-medium" -> { model = "xxxxxxxxxx-yyy", effort = "low" }
+--   "xxxxxxxxxx-yyy-high"   -> { model = "xxxxxxxxxx-yyy", effort = "xhigh" }
+--   "xxxxxxxxxx-yyy-low"    -> { model = "xxxxxxxxxx-yyy", thinking = { type = "disabled" } }
+-- Models without a suffix are passed through unchanged.
+local function normalizeAnthropicModel(model)
+  local base_model, suffix = model:match('^(.*)%-(.+)$')
 
-  if model ~= 'claude-sonnet-5' and not suffix then
+  if not base_model or not suffix then
     return { model = model }
   end
 
   if suffix == 'medium' then
-    return { model = 'claude-sonnet-5', effort = 'low' }
+    return { model = base_model, effort = 'low' }
   elseif suffix == 'high' then
-    return { model = 'claude-sonnet-5', effort = 'xhigh' }
+    return { model = base_model, effort = 'xhigh' }
   else
-    -- Bare "claude-sonnet-5", suffix == 'low', or any other unknown suffix
-    -- all fall back to thinking disabled, matching the TS agent's default case.
-    return { model = 'claude-sonnet-5', thinking = { type = 'disabled' } }
+    return { model = base_model, thinking = { type = 'disabled' } }
   end
 end
 
@@ -59,7 +51,7 @@ local anthropic_runner = provider.createQueryRunner({
   -- exact shape (plain string content per turn), so we pass it through as-is,
   -- matching wire-for-wire what anthropic-agent's buildRequestBody() sends today.
   build_request_body = function(model, instruction, messages)
-    local normalized = normalizeClaudeSonnet5Model(model)
+    local normalized = normalizeAnthropicModel(model)
 
     local request_body = {
       model = normalized.model,
@@ -133,5 +125,5 @@ function query.askLight(model, instruction, prompt, opts, api_key, upload_url, u
   anthropic_runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public, scanned_files)
 end
 
-return query
 
+return query
