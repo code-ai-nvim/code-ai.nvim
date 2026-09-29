@@ -3,34 +3,34 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a "gemini-3.[567]-flash" model name that may carry a thinking-level suffix
--- (e.g. "gemini-3.5-flash-minimal", "gemini-3.6-flash-medium", "gemini-3.7-flash-high").
--- Mirrors the logic implemented in code-ai-agent/googleai-agent/src/main.ts
--- The returned `model` field is also the bare model id used to build the
--- `:generateContent` REST endpoint URL.
-local function normalizeGeminiFlashModel(model)
-  local version, level
+-- Generic suffix-based model normalization for Google AI.
+-- Any model name of the form "<base>-<suffix>" is split on its last `-` separator:
+-- the part before is used as the actual model id sent to the API, and the suffix
+-- drives the thinking configuration:
+--   - "high"   -> thinking_level "high"
+--   - "medium" -> thinking_level "medium"
+--   - "low"    -> thinking_level "low"
+--   - any other suffix -> least thinking available ("low" for Gemini 3.7, "minimal" otherwise)
+-- If no suffix separator exists, the model is passed through as-is without thinkingConfig.
+-- Model existence itself is not validated here; that responsibility is delegated to the upstream API.
+local function normalizeGoogleAIModel(model)
+  local base_model, suffix = model:match('^(.*)%-(.+)$')
 
-  version, level = model:match('^gemini%-(3%.[56789])%-flash%-(minimal)$')
-  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(low)$') end
-  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(medium)$') end
-  if not version then version, level = model:match('^gemini%-(3%.[56789])%-flash%-(high)$') end
-
-  if not version then
-    -- No suffix: still normalize if it matches the base pattern, defaulting to 'low'
-    version = model:match('^gemini%-(3%.[56789])%-flash$')
-    level = version and 'low' or nil
-  end
-
-  if not version then
+  if not base_model or not suffix then
     return { model = model }
   end
 
-  if version == '3.7' and level == 'minimal' then
-    level = 'low'
+  if suffix == 'high' then
+    return { model = base_model, thinking_level = 'high' }
+  elseif suffix == 'medium' then
+    return { model = base_model, thinking_level = 'medium' }
+  elseif suffix == 'low' then
+    return { model = base_model, thinking_level = 'low' }
+  else
+    local is_gemini_37 = base_model:match('3%.7') ~= nil
+    local thinking_level = is_gemini_37 and 'low' or 'minimal'
+    return { model = base_model, thinking_level = thinking_level }
   end
-
-  return { model = 'gemini-' .. version .. '-flash', thinking_level = level }
 end
 
 -- Map an ordered conversation ({ role = "user"|"assistant", content = "..." })
@@ -71,7 +71,7 @@ local googleai_runner = provider.createQueryRunner({
   -- request URL here rather than relying on a static `api_path`.
   -- Mirrors: POST {api_host}/v1/publishers/google/models/{model}:generateContent?key={api_key}
   build_url = function(api_host, api_key, model)
-    local normalized = normalizeGeminiFlashModel(model)
+    local normalized = normalizeGoogleAIModel(model)
     return api_host .. '/v1/publishers/google/models/' .. normalized.model .. ':generateContent?key=' .. api_key
   end,
   -- `messages` is an ordered array of { role = "user"|"assistant", content = "..." }
@@ -79,7 +79,7 @@ local googleai_runner = provider.createQueryRunner({
   -- Content[] input shape, matching wire-for-wire what googleai-agent's
   -- buildRequestBody() sends today.
   build_request_body = function(model, instruction, messages)
-    local normalized = normalizeGeminiFlashModel(model)
+    local normalized = normalizeGoogleAIModel(model)
 
     local request_body = {
       contents = messagesToContents(messages),
