@@ -3,16 +3,14 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a trailing reasoning-effort suffix.
--- Any model name of the form "<base>-<suffix>" is split on its last `-` separator:
--- the part before is used as the actual model id sent to the API, and the suffix
--- drives Anthropic's `output_config.effort`:
---   - "low"    -> effort "low"
---   - "medium" -> effort "medium"
---   - "high"   -> effort "high"
---   - "xhigh"  -> effort "xhigh"
---   - "max"    -> effort "max"
--- Models without one of these explicit suffixes are passed through unchanged.
+-- Normalize a model name that may carry a trailing provider-specific suffix.
+-- The project treats provider suffixes uniformly: split on the last `-`
+-- separator, keep the base model id, and map the suffix to the provider's valid
+-- API field when it is recognized. For Anthropic, valid effort values are
+-- `low`, `medium`, `high`, `xhigh`, and `max`; the `between_tools` thinking
+-- mode is used as the cheapest safe fallback for `none` or any unrecognized
+-- suffix. Models without a recognized trailing suffix are passed through
+-- unchanged.
 local function normalizeAnthropicModel(model)
   local base_model, suffix = model:match('^(.*)%-(.+)$')
 
@@ -28,7 +26,7 @@ local function normalizeAnthropicModel(model)
     return { model = base_model, effort = suffix }
   end
 
-  return { model = model }
+  return { model = base_model, thinking = { type = 'between_tools' } }
 end
 
 local anthropic_runner = provider.createQueryRunner({
@@ -64,6 +62,10 @@ local anthropic_runner = provider.createQueryRunner({
       max_tokens = 128000,
       messages = messages,
     }
+
+    if normalized.thinking then
+      request_body.thinking = normalized.thinking
+    end
 
     if normalized.effort then
       request_body.output_config = { effort = normalized.effort }

@@ -3,16 +3,15 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Generic suffix-based model normalization for Google AI.
--- Any model name of the form "<base>-<suffix>" is split on its last `-` separator:
--- the part before is used as the actual model id sent to the API, and the suffix
--- drives the thinking configuration:
---   - "high"   -> thinking_level "high"
---   - "medium" -> thinking_level "medium"
---   - "low"    -> thinking_level "low"
---   - any other suffix -> least thinking available ("low" for Gemini 3.7, "minimal" otherwise)
--- If no suffix separator exists, the model is passed through as-is without thinkingConfig.
--- Model existence itself is not validated here; that responsibility is delegated to the upstream API.
+-- Normalize a model name that may carry a trailing provider-specific suffix.
+-- The project treats provider suffixes uniformly: split on the last `-`
+-- separator, keep the base model id, and map the suffix to the provider's valid
+-- API field when it is recognized. For Google AI, valid thinking levels are
+-- `minimal`, `low`, `medium`, and `high`. If the suffix is explicitly `none` or
+-- is otherwise unrecognized, we fall back to the cheapest valid level
+-- (`low` for Gemini 3.7+, otherwise `minimal`) so the request stays predictable
+-- and low-cost. Models without a recognized trailing suffix are passed through
+-- unchanged.
 local function normalizeGoogleAIModel(model)
   local base_model, suffix = model:match('^(.*)%-(.+)$')
 
@@ -20,12 +19,11 @@ local function normalizeGoogleAIModel(model)
     return { model = model }
   end
 
-  if suffix == 'high' then
-    return { model = base_model, thinking_level = 'high' }
-  elseif suffix == 'medium' then
-    return { model = base_model, thinking_level = 'medium' }
-  elseif suffix == 'low' then
-    return { model = base_model, thinking_level = 'low' }
+  if suffix == 'minimal'
+      or suffix == 'low'
+      or suffix == 'medium'
+      or suffix == 'high' then
+    return { model = base_model, thinking_level = suffix }
   else
     local is_gemini_37 = base_model:match('3%.7') ~= nil
     local thinking_level = is_gemini_37 and 'low' or 'minimal'

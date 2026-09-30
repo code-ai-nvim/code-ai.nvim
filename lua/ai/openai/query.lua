@@ -3,13 +3,14 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize an OpenAI model name that may carry a trailing reasoning-effort suffix.
--- Examples:
---   "gpt-6-astra-max" -> { model = "gpt-6-astra", reasoning_effort = "max" }
---   "gpt-5-high"      -> { model = "gpt-5", reasoning_effort = "high" }
---   "gpt-5-medium"    -> { model = "gpt-5", reasoning_effort = "medium" }
---   "gpt-5-low"       -> { model = "gpt-5", reasoning_effort = "low" }
--- Models without one of these explicit suffixes are passed through unchanged.
+-- Normalize a model name that may carry a trailing provider-specific suffix.
+-- The project treats provider suffixes uniformly: split on the last `-`
+-- separator, keep the base model id, and map the suffix to the provider's valid
+-- API field when it is recognized. For OpenAI, accepted reasoning values are
+-- `low`, `medium`, `high`, `xhigh`, `max`, and `none` (where supported).
+-- If the suffix is explicitly `none` or is otherwise unrecognized, we fall back
+-- to `reasoning.effort = "none"` so the request stays predictable and cheap.
+-- Models without a recognized trailing suffix are passed through unchanged.
 local function normalizeOpenAIModel(model)
   local base_model, suffix = model:match('^(.*)%-(.+)$')
 
@@ -17,9 +18,7 @@ local function normalizeOpenAIModel(model)
     return { model = model }
   end
 
-  if suffix == 'none'
-      or suffix == 'minimal'
-      or suffix == 'low'
+  if suffix == 'low'
       or suffix == 'medium'
       or suffix == 'high'
       or suffix == 'xhigh'
@@ -27,7 +26,7 @@ local function normalizeOpenAIModel(model)
     return { model = base_model, reasoning_effort = suffix }
   end
 
-  return { model = model }
+  return { model = base_model, reasoning_effort = 'none' }
 end
 
 local openai_runner = provider.createQueryRunner({

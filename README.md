@@ -80,6 +80,59 @@ If agent mode is selected but the matching `*_agent_host` option is empty, the c
 
 You can find the agent in the repository [code-ai-agent](https://github.com/rakotomandimby/code-ai-agent).
 
+## Valid effort / thinking levels by provider
+
+This project deliberately avoids invalid provider-specific effort values. The suffix parsing logic strips a trailing model suffix and maps it to the provider's valid effort/thinking field.
+
+### OpenAI Responses API
+
+OpenAI `reasoning.effort` valid values for the GPT-6 family are:
+
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+- `max`
+- `none` (supported only on some GPT-6 variants; not a universal value)
+
+The code treats `none` as the explicit cheapest/off setting when present, and falls back to `none` for any unknown or invalid suffix to keep the request predictable and low-cost.
+
+### Anthropic Claude 5.5
+
+Anthropic valid effort values are:
+
+- `low`
+- `medium`
+- `high`
+- `xhigh`
+- `max`
+
+Anthropic accepted `thinking.type` values are:
+
+- `adaptive`
+- `between_tools`
+
+For Sonnet 5.5, `between_tools` is the safe replacement for the invalid `disabled` request. `disabled` is not valid and should not be sent.
+
+### Google Vertex AI / Gemini
+
+For Gemini 3.5 Flash Lite and 3.8 Flash, the valid `thinkingConfig.thinkingLevel` values are:
+
+- `minimal`
+- `low`
+- `medium`
+- `high`
+
+For Gemini 3.5 Flash Lite, `minimal` is the lowest-cost/default setting; for Gemini 3.8 Flash, `low` is the lowest-cost/default setting. The code maps unknown suffixes to the provider's cheapest valid level instead of sending an invalid value.
+
+### Valid suffix map used by the project
+
+| Provider | Valid suffixes | Fallback for invalid/unknown suffix |
+| --- | --- | --- |
+| OpenAI | `low`, `medium`, `high`, `xhigh`, `max`, `none` | `none` |
+| Anthropic | `low`, `medium`, `high`, `xhigh`, `max` | `between_tools` |
+| GoogleAI | `minimal`, `low`, `medium`, `high` | cheapest valid level (Gemini 3.7+: `low`, otherwise `minimal`) |
+
 ## Installation
 
 First get API keys from:
