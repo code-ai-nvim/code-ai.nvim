@@ -3,6 +3,33 @@ local provider = require('ai.provider')
 
 local query = {}
 
+-- Normalize an OpenAI model name that may carry a trailing reasoning-effort suffix.
+-- Examples:
+--   "gpt-6-astra-max" -> { model = "gpt-6-astra", reasoning_effort = "max" }
+--   "gpt-5-high"      -> { model = "gpt-5", reasoning_effort = "high" }
+--   "gpt-5-medium"    -> { model = "gpt-5", reasoning_effort = "medium" }
+--   "gpt-5-low"       -> { model = "gpt-5", reasoning_effort = "low" }
+-- Models without one of these explicit suffixes are passed through unchanged.
+local function normalizeOpenAIModel(model)
+  local base_model, suffix = model:match('^(.*)%-(.+)$')
+
+  if not base_model or not suffix then
+    return { model = model }
+  end
+
+  if suffix == 'none'
+      or suffix == 'minimal'
+      or suffix == 'low'
+      or suffix == 'medium'
+      or suffix == 'high'
+      or suffix == 'xhigh'
+      or suffix == 'max' then
+    return { model = base_model, reasoning_effort = suffix }
+  end
+
+  return { model = model }
+end
+
 local openai_runner = provider.createQueryRunner({
   name = "OpenAI",
   title_tag = "OPN",
@@ -31,6 +58,7 @@ local openai_runner = provider.createQueryRunner({
   -- with plain string content, matching wire-for-wire what openai-agent's
   -- buildRequestBody() sends today (conversationMessages.map(({role, content}) => ({role, content}))).
   build_request_body = function(model, instruction, messages)
+    local normalized = normalizeOpenAIModel(model)
     local input_messages = {}
     for _, message in ipairs(messages or {}) do
       table.insert(input_messages, {
@@ -40,9 +68,13 @@ local openai_runner = provider.createQueryRunner({
     end
 
     local request_body = {
-      model = model,
+      model = normalized.model,
       input = input_messages,
     }
+
+    if normalized.reasoning_effort then
+      request_body.reasoning = { effort = normalized.reasoning_effort }
+    end
 
     if instruction and instruction ~= '' then
       request_body.instructions = instruction
@@ -125,4 +157,3 @@ function query.askLight(model, instruction, prompt, opts, api_key, upload_url, u
 end
 
 return query
-
