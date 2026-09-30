@@ -7,7 +7,7 @@ local query = {}
 -- Examples:
 --   "xxxxxxxxxx-yyy-medium" -> { model = "xxxxxxxxxx-yyy", effort = "low" }
 --   "xxxxxxxxxx-yyy-high"   -> { model = "xxxxxxxxxx-yyy", effort = "xhigh" }
---   "xxxxxxxxxx-yyy-low"    -> { model = "xxxxxxxxxx-yyy", thinking = { type = "disabled" } }
+--   "xxxxxxxxxx-yyy-low"    -> { model = "xxxxxxxxxx-yyy", thinking = { type = "between_tools" } }
 -- Models without a suffix are passed through unchanged.
 local function normalizeAnthropicModel(model)
   local base_model, suffix = model:match('^(.*)%-(.+)$')
@@ -21,7 +21,7 @@ local function normalizeAnthropicModel(model)
   elseif suffix == 'high' then
     return { model = base_model, effort = 'xhigh' }
   else
-    return { model = base_model, thinking = { type = 'disabled' } }
+    return { model = base_model, thinking = { type = 'between_tools' } }
   end
 end
 
