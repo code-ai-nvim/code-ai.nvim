@@ -3,12 +3,16 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a trailing suffix.
--- Examples:
---   "xxxxxxxxxx-yyy-medium" -> { model = "xxxxxxxxxx-yyy", effort = "low" }
---   "xxxxxxxxxx-yyy-high"   -> { model = "xxxxxxxxxx-yyy", effort = "xhigh" }
---   "xxxxxxxxxx-yyy-low"    -> { model = "xxxxxxxxxx-yyy", thinking = { type = "between_tools" } }
--- Models without a suffix are passed through unchanged.
+-- Normalize a model name that may carry a trailing reasoning-effort suffix.
+-- Any model name of the form "<base>-<suffix>" is split on its last `-` separator:
+-- the part before is used as the actual model id sent to the API, and the suffix
+-- drives Anthropic's `output_config.effort`:
+--   - "low"    -> effort "low"
+--   - "medium" -> effort "medium"
+--   - "high"   -> effort "high"
+--   - "xhigh"  -> effort "xhigh"
+--   - "max"    -> effort "max"
+-- Models without one of these explicit suffixes are passed through unchanged.
 local function normalizeAnthropicModel(model)
   local base_model, suffix = model:match('^(.*)%-(.+)$')
 
@@ -16,13 +20,15 @@ local function normalizeAnthropicModel(model)
     return { model = model }
   end
 
-  if suffix == 'medium' then
-    return { model = base_model, effort = 'low' }
-  elseif suffix == 'high' then
-    return { model = base_model, effort = 'xhigh' }
-  else
-    return { model = base_model, thinking = { type = 'between_tools' } }
+  if suffix == 'low'
+      or suffix == 'medium'
+      or suffix == 'high'
+      or suffix == 'xhigh'
+      or suffix == 'max' then
+    return { model = base_model, effort = suffix }
   end
+
+  return { model = model }
 end
 
 local anthropic_runner = provider.createQueryRunner({
@@ -58,10 +64,6 @@ local anthropic_runner = provider.createQueryRunner({
       max_tokens = 128000,
       messages = messages,
     }
-
-    if normalized.thinking then
-      request_body.thinking = normalized.thinking
-    end
 
     if normalized.effort then
       request_body.output_config = { effort = normalized.effort }
