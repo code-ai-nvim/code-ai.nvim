@@ -3,17 +3,16 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a trailing provider-specific suffix.
--- The project treats provider suffixes uniformly: split on the last `-`
--- separator, keep the base model id, and map the suffix to the provider's valid
--- API field when it is recognized. For Google AI, valid thinking levels are
--- `minimal`, `low`, `medium`, and `high`. If the suffix is explicitly `none` or
--- is otherwise unrecognized, we fall back to the cheapest valid level
--- (`low` for Gemini 3.7+, otherwise `minimal`) so the request stays predictable
--- and low-cost. Models without a recognized trailing suffix are passed through
--- unchanged.
+-- Normalize a model name that may carry a provider-specific effort level suffix.
+-- The project treats effort levels uniformly: split on the `:` separator,
+-- keep the base model id, and map the suffix to the provider's valid API field
+-- when it is recognized. For Google AI, valid thinking levels are `minimal`,
+-- `low`, `medium`, and `high`. `none` maps to the cheapest valid level
+-- (`low` for Gemini 3.7+, otherwise `minimal`).
+-- Models without a `:` separator or with an unrecognized suffix are passed
+-- through unchanged so model existence can be validated by the upstream API.
 local function normalizeGoogleAIModel(model)
-  local base_model, suffix = model:match('^(.*)%-(.+)$')
+  local base_model, suffix = model:match('^(.*):(.+)$')
 
   if not base_model or not suffix then
     return { model = model }
@@ -24,11 +23,13 @@ local function normalizeGoogleAIModel(model)
       or suffix == 'medium'
       or suffix == 'high' then
     return { model = base_model, thinking_level = suffix }
-  else
+  elseif suffix == 'none' then
     local is_gemini_37 = base_model:match('3%.7') ~= nil
     local thinking_level = is_gemini_37 and 'low' or 'minimal'
     return { model = base_model, thinking_level = thinking_level }
   end
+
+  return { model = model }
 end
 
 -- Map an ordered conversation ({ role = "user"|"assistant", content = "..." })

@@ -3,16 +3,15 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a trailing provider-specific suffix.
--- The project treats provider suffixes uniformly: split on the last `-`
--- separator, keep the base model id, and map the suffix to the provider's valid
--- API field when it is recognized. For Anthropic, valid effort values are
--- `low`, `medium`, `high`, `xhigh`, and `max`; the `between_tools` thinking
--- mode is used as the cheapest safe fallback for `none` or any unrecognized
--- suffix. Models without a recognized trailing suffix are passed through
--- unchanged.
+-- Normalize a model name that may carry a provider-specific effort level suffix.
+-- The project treats effort levels uniformly: split on the `:` separator,
+-- keep the base model id, and map the suffix to the provider's valid API field
+-- when it is recognized. For Anthropic, valid effort values are `low`, `medium`,
+-- `high`, `xhigh`, and `max`; `none` maps to the `between_tools` thinking mode.
+-- Models without a `:` separator or with an unrecognized suffix are passed
+-- through unchanged so model existence can be validated by the upstream API.
 local function normalizeAnthropicModel(model)
-  local base_model, suffix = model:match('^(.*)%-(.+)$')
+  local base_model, suffix = model:match('^(.*):(.+)$')
 
   if not base_model or not suffix then
     return { model = model }
@@ -24,9 +23,11 @@ local function normalizeAnthropicModel(model)
       or suffix == 'xhigh'
       or suffix == 'max' then
     return { model = base_model, effort = suffix }
+  elseif suffix == 'none' then
+    return { model = base_model, thinking = { type = 'between_tools' } }
   end
 
-  return { model = base_model, thinking = { type = 'between_tools' } }
+  return { model = model }
 end
 
 local anthropic_runner = provider.createQueryRunner({
