@@ -11,7 +11,7 @@ local query = {}
 -- Models without a `:` separator or with an unrecognized suffix are passed
 -- through unchanged so model existence can be validated by the upstream API.
 local function normalizeOpenAIModel(model)
-  local base_model, suffix = model:match('^(.*):(.+)$')
+  local base_model, suffix = model:match('^(.+):(.+)$')
 
   if not base_model or not suffix then
     return { model = model }
