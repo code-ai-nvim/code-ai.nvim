@@ -33,6 +33,16 @@ local function build_project_context(scanned_files_list)
     end
   end
 
+  if #project_context > 0 then
+    local names = {}
+    for _, item in ipairs(project_context) do
+      table.insert(names, item.filename)
+    end
+    common.log(string.format("build_project_context: %d context file(s) loaded: %s", #project_context, table.concat(names, ", ")))
+  else
+    common.log("build_project_context: No context files loaded (empty list or all skipped).")
+  end
+
   return project_context
 end
 

@@ -72,6 +72,17 @@ local function isEmpty(text)
   return text == nil or text == ''
 end
 
+local function formatContextFiles(files)
+  if not files or #files == 0 then
+    return "none"
+  end
+  local lines = {}
+  for _, f in ipairs(files) do
+    table.insert(lines, "  - " .. tostring(f))
+  end
+  return string.format("(%d file(s)):\n%s", #files, table.concat(lines, "\n"))
+end
+
 function M.hasLetters(text)
   return type(text) == 'string' and text:match('[a-zA-Z]') ~= nil
 end
@@ -303,7 +314,7 @@ function M.handle(name, input)
 
   if query_mode == "standalone" then
     is_heavy = false
-    scanned_files_list = nil
+    scanned_files_list = aiconfig.listScannedFilesFromConfig()
     common.log("Using standalone mode (forced by command configuration)")
   elseif query_mode == "agent" then
     is_heavy = true
@@ -344,6 +355,12 @@ function M.handle(name, input)
   local update = M.createPopup(renderStatus(initial_status), width - 8, height - 4)
   local original_prompt = M.fill(def.prompt_tpl, args)
 
+  common.log("================================================================================")
+  common.log(string.format("[Pipeline] Starting command: '%s' (has_planning = %s)", name, tostring(has_planning)))
+  common.log(string.format("[Pipeline] Context files sent: %s", formatContextFiles(scanned_files_list)))
+  common.log(string.format("[Pipeline] User prompt:\n%s", original_prompt))
+  common.log("--------------------------------------------------------------------------------")
+
   local common_query_opts = {
     upload_url = M.opts.upload_url,
     upload_token = M.opts.upload_token,
@@ -354,8 +371,14 @@ function M.handle(name, input)
   local function executeImplement(final_implement_prompt)
     if has_planning then
       update(renderStatus(string.format("[3/3] Implementing (%s)...", implement_parsed.full)))
+      common.log(string.format("[Pipeline] === [3/3] Executing Implement (%s) ===", implement_parsed.full))
+      common.log(string.format("[Pipeline] Context files sent to Implement: %s", formatContextFiles(scanned_files_list)))
+      common.log(string.format("[Pipeline] Merged prompt+plan:\n%s", final_implement_prompt))
     else
       update(renderStatus(string.format("Implementing (%s)...", implement_parsed.full)))
+      common.log(string.format("[Pipeline] === Executing Implement directly (%s) ===", implement_parsed.full))
+      common.log(string.format("[Pipeline] Context files sent to Implement: %s", formatContextFiles(scanned_files_list)))
+      common.log(string.format("[Pipeline] Implement prompt:\n%s", final_implement_prompt))
     end
 
     local query_opts = {
@@ -368,7 +391,11 @@ function M.handle(name, input)
       end,
       callback = function(res, is_error)
         if is_error or (type(res) == 'string' and string.sub(res, 1, 13) == "# Agent Error") then
+          common.log(string.format("[Pipeline] Error during Implement step: %s", tostring(res)))
           update(res)
+        else
+          common.log(string.format("[Pipeline] Implementation completed successfully from %s.", implement_parsed.full))
+          common.log("================================================================================")
         end
       end,
       upload_url = common_query_opts.upload_url,
@@ -399,15 +426,21 @@ function M.handle(name, input)
       plan_text
     )
 
+    common.log(string.format("[Pipeline] === [2/3] Executing Reword (%s) ===", reword_parsed.full))
+    common.log(string.format("[Pipeline] Plan received to reword:\n%s", plan_text))
+    common.log(string.format("[Pipeline] Reword prompt:\n%s", reword_prompt))
+
     local query_opts = {
       raw_output = true,
       handleResult = function(output) return output end,
       callback = function(res, is_error)
         if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
-          common.log("Error during Reword step: " .. tostring(res))
+          common.log(string.format("[Pipeline] Error during Reword step: %s", tostring(res)))
           update("# Error during Reword step\n\n" .. tostring(res))
           return
         end
+
+        common.log(string.format("[Pipeline] Reword output received from %s:\n%s", reword_parsed.full, tostring(res)))
 
         local combined_implement_prompt = original_prompt .. "\n\n### Implementation Plan & Instructions:\n" .. res
         executeImplement(combined_implement_prompt)
@@ -432,16 +465,21 @@ function M.handle(name, input)
   local function executePlan()
     update(renderStatus(string.format("[1/3] Planning (%s)...", plan_parsed.full)))
 
+    common.log(string.format("[Pipeline] === [1/3] Executing Plan (%s) ===", plan_parsed.full))
+    common.log(string.format("[Pipeline] Context files sent to Plan: %s", formatContextFiles(scanned_files_list)))
+    common.log(string.format("[Pipeline] Plan prompt:\n%s", original_prompt))
+
     local query_opts = {
       raw_output = true,
       handleResult = function(output) return output end,
       callback = function(res, is_error)
         if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
-          common.log("Error during Plan step: " .. tostring(res))
+          common.log(string.format("[Pipeline] Error during Plan step: %s", tostring(res)))
           update("# Error during Plan step\n\n" .. tostring(res))
           return
         end
 
+        common.log(string.format("[Pipeline] Plan output received from %s:\n%s", plan_parsed.full, tostring(res)))
         executeReword(res)
       end,
       upload_url = common_query_opts.upload_url,
@@ -463,6 +501,7 @@ function M.handle(name, input)
   if has_planning then
     executePlan()
   else
+    common.log("[Pipeline] Planning stage skipped (plan or reword model not specified).")
     executeImplement(original_prompt)
   end
 end
