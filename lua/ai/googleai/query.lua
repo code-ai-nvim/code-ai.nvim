@@ -3,30 +3,25 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a provider-specific effort level suffix.
--- The project treats effort levels uniformly: split on the `:` separator,
--- keep the base model id, and map the suffix to the provider's valid API field
--- when it is recognized. For Google AI, valid thinking levels are `minimal`,
--- `low`, `medium`, and `high`. `none` maps to the cheapest valid level
--- (`low` for Gemini 3.7+, otherwise `minimal`).
--- Models without a `:` separator or with an unrecognized suffix are passed
--- through unchanged so model existence can be validated by the upstream API.
-local function normalizeGoogleAIModel(model)
-  local base_model, suffix = model:match('^(.+):(.+)$')
+-- Valid Google AI thinking levels.
+local THINKING_LEVELS = { minimal = true, low = true, medium = true, high = true }
 
-  if not base_model or not suffix then
+-- Split an optional effort suffix off the model id (see common.splitModelSuffix).
+-- Recognized suffixes map to `thinkingConfig.thinkingLevel`. `none` maps to the
+-- cheapest valid level (`low` for Gemini 3.7+, otherwise `minimal`).
+-- Unrecognized suffixes are passed through so the upstream API can validate them.
+local function normalize_model(model)
+  local base_model, suffix = common.splitModelSuffix(model)
+
+  if suffix == nil then
     return { model = model }
   end
 
-  if suffix == 'minimal'
-      or suffix == 'low'
-      or suffix == 'medium'
-      or suffix == 'high' then
+  if THINKING_LEVELS[suffix] then
     return { model = base_model, thinking_level = suffix }
   elseif suffix == 'none' then
     local is_gemini_37 = base_model:match('3%.7') ~= nil
-    local thinking_level = is_gemini_37 and 'low' or 'minimal'
-    return { model = base_model, thinking_level = thinking_level }
+    return { model = base_model, thinking_level = is_gemini_37 and 'low' or 'minimal' }
   end
 
   return { model = model }
@@ -37,7 +32,7 @@ end
 -- googleai-agent's buildRequestBody():
 --   role="user"      -> { role = "user",  parts = [{ text = ... }] }
 --   role="assistant" -> { role = "model", parts = [{ text = ... }] }
-local function messagesToContents(messages)
+local function messages_to_contents(messages)
   local contents = {}
   for _, message in ipairs(messages or {}) do
     local role = (message.role == 'user') and 'user' or 'model'
@@ -49,6 +44,25 @@ local function messagesToContents(messages)
   return contents
 end
 
+-- Error text shown in the popup. The leading "\n#GoogleAI error" form is
+-- intentional (it is matched by the generic error heuristic).
+local function googleai_error(body)
+  return '\n#GoogleAI error\n\n' .. body .. '\n'
+end
+
+local function first_candidate(data)
+  return (data['candidates'] or {})[1]
+end
+
+-- Parts of the first candidate's content, or nil when absent.
+local function first_candidate_parts(data)
+  local candidate = first_candidate(data)
+  if not candidate or not candidate.content then
+    return nil
+  end
+  return candidate.content.parts
+end
+
 local googleai_runner = provider.createQueryRunner({
   name = "GoogleAI",
   title_tag = "GGL",
@@ -58,30 +72,26 @@ local googleai_runner = provider.createQueryRunner({
     candidates = { { content = { role = "model", parts = { { text = "GoogleAI models are disabled" } } } } },
     usageMetadata = { promptTokenCount = 0, candidatesTokenCount = 0 }
   },
-  -- The `generateContent` method authenticates via the `key` query parameter
-  -- (see build_url below), so no API-key header is needed here.
+  -- `generateContent` authenticates via the `key` query parameter (see
+  -- build_url), so no API-key header is needed.
   build_headers = function()
     return {
       ['Content-type'] = 'application/json',
     }
   end,
-  -- The `generateContent` method takes the model id and the API key directly
-  -- in the URL, instead of a fixed path + header, so we build the full
-  -- request URL here rather than relying on a static `api_path`.
-  -- Mirrors: POST {api_host}/v1/publishers/google/models/{model}:generateContent?key={api_key}
+  -- The model id and API key live in the URL, so no static `api_path` is used.
+  -- POST {api_host}/v1/publishers/google/models/{model}:generateContent?key={api_key}
   build_url = function(api_host, api_key, model)
-    local normalized = normalizeGoogleAIModel(model)
+    local normalized = normalize_model(model)
     return api_host .. '/v1/publishers/google/models/' .. normalized.model .. ':generateContent?key=' .. api_key
   end,
-  -- `messages` is an ordered array of { role = "user"|"assistant", content = "..." }
-  -- built by ai.conversation.build(). We convert it to the `generateContent` API's
-  -- Content[] input shape, matching wire-for-wire what googleai-agent's
-  -- buildRequestBody() sends today.
+  -- `messages` (from ai.conversation.build()) is converted to the API's
+  -- Content[] shape, matching what googleai-agent's buildRequestBody() sends.
   build_request_body = function(model, instruction, messages)
-    local normalized = normalizeGoogleAIModel(model)
+    local normalized = normalize_model(model)
 
     local request_body = {
-      contents = messagesToContents(messages),
+      contents = messages_to_contents(messages),
       generationConfig = {
         temperature = 0.2,
         topP = 0.5
@@ -104,21 +114,21 @@ local googleai_runner = provider.createQueryRunner({
         local reason = data['promptFeedback']['blockReason']
         local message = data['promptFeedback']['blockReasonMessage'] or ''
         local details = message ~= '' and ('\n\n' .. message) or ''
-        return '\n#GoogleAI error\n\nPrompt blocked. Reason: ' .. reason .. details .. '\n'
+        return googleai_error('Prompt blocked. Reason: ' .. reason .. details)
       elseif data['error'] then
-        return '\n#GoogleAI error\n\nGoogleAI stopped with the reason: '
-          .. (data['error']['message'] or 'unknown') .. '\n'
+        return googleai_error('GoogleAI stopped with the reason: ' .. (data['error']['message'] or 'unknown'))
       else
-        return '\n#GoogleAI error\n\nUnknown error or empty response.\n'
+        return googleai_error('Unknown error or empty response.')
       end
     end
 
-    local first_candidate = candidates[1]
-    if not first_candidate or not first_candidate.content or not first_candidate.content.parts or #first_candidate.content.parts == 0 then
-      if first_candidate and first_candidate.finishReason and first_candidate.finishReason ~= 'STOP' then
-        return '\n#GoogleAI error\n\nGeneration stopped with reason: ' .. first_candidate.finishReason .. '\n'
+    local parts = first_candidate_parts(data)
+    if not parts or #parts == 0 then
+      local candidate = first_candidate(data)
+      if candidate and candidate.finishReason and candidate.finishReason ~= 'STOP' then
+        return googleai_error('Generation stopped with reason: ' .. candidate.finishReason)
       end
-      return '\n#GoogleAI error\n\nNo model output found.\n'
+      return googleai_error('No model output found.')
     end
 
     return nil
@@ -128,14 +138,13 @@ local googleai_runner = provider.createQueryRunner({
     return usage.promptTokenCount or 0, usage.candidatesTokenCount or 0
   end,
   extract_content = function(data)
-    local candidates = data['candidates'] or {}
-    local first_candidate = candidates[1]
-    if not first_candidate or not first_candidate.content or not first_candidate.content.parts then
+    local parts = first_candidate_parts(data)
+    if not parts then
       return ""
     end
 
     local texts = {}
-    for _, part in ipairs(first_candidate.content.parts) do
+    for _, part in ipairs(parts) do
       if part.text then
         table.insert(texts, part.text)
       end
@@ -163,13 +172,7 @@ local googleai_runner = provider.createQueryRunner({
   end
 })
 
-function query.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-  googleai_runner.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-end
-
-function query.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-  googleai_runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-end
+query.askHeavy = googleai_runner.askHeavy
+query.askLight = googleai_runner.askLight
 
 return query
-

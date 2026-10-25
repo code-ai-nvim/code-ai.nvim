@@ -40,37 +40,35 @@ M.opts = {
   stats_ingestion_token = '',
 }
 M.prompts = default_prompts
+
+-- Window id of the current result popup (nil when none is open)
 local win_id
 
-local function splitLines(input)
-  local lines = {}
-  local offset = 1
-  while offset > 0 do
-    local i = string.find(input, '\n', offset)
-    if i == nil then
-      table.insert(lines, string.sub(input, offset, -1))
-      offset = 0
-    else
-      table.insert(lines, string.sub(input, offset, i - 1))
-      offset = i + 1
-    end
-  end
-  return lines
+local providers = {
+  anthropic = anthropic,
+  googleai = googleai,
+  openai = openai,
+}
+
+-- ===== Text helpers =====
+
+local function split_lines(input)
+  return vim.split(input, '\n', { plain = true })
 end
 
-local function joinLines(lines)
-  local result = ""
-  for _, line in ipairs(lines) do
-    result = result .. line .. "\n"
+-- Every line is followed by a newline; an empty list gives "".
+local function join_lines(lines)
+  if #lines == 0 then
+    return ""
   end
-  return result
+  return table.concat(lines, "\n") .. "\n"
 end
 
-local function isEmpty(text)
+local function is_empty(text)
   return text == nil or text == ''
 end
 
-local function formatContextFiles(files)
+local function format_context_files(files)
   if not files or #files == 0 then
     return "none"
   end
@@ -93,12 +91,38 @@ function M.getSelectedText(esc)
   local vend = vim.fn.getpos("'>")
   local ok, lines = pcall(vim.api.nvim_buf_get_text, 0, vstart[2] - 1, vstart[3] - 1, vend[2] - 1, vend[3], {})
   if ok then
-    return joinLines(lines)
+    return join_lines(lines)
   else
     lines = vim.api.nvim_buf_get_lines(0, vstart[2] - 1, vend[2], false)
-    return joinLines(lines)
+    return join_lines(lines)
   end
 end
+
+--- Fill `${key}` placeholders of a template with the given values.
+---@param tpl string|nil
+---@param args table<string, any>
+---@return string
+function M.fill(tpl, args)
+  if tpl == nil then
+    tpl = ''
+  else
+    for key, value in pairs(args) do
+      local str_value = (value == nil) and '' or tostring(value)
+      local escaped_value = str_value:gsub('%%', '%%%%')
+      tpl = string.gsub(tpl, '%${' .. key .. '}', escaped_value)
+    end
+  end
+  return tpl
+end
+
+function M.assign(target, source)
+  for k, v in pairs(source) do
+    target[k] = v
+  end
+  return target
+end
+
+-- ===== Popup =====
 
 function M.close()
   if win_id == nil or win_id == vim.api.nvim_get_current_win() then
@@ -108,6 +132,11 @@ function M.close()
   win_id = nil
 end
 
+--- Open the result popup. Returns an `update(content)` function to replace its text.
+---@param initialContent string
+---@param width number
+---@param height number
+---@return fun(content: string|nil)
 function M.createPopup(initialContent, width, height)
   M.close()
   local bufnr = vim.api.nvim_create_buf(false, true)
@@ -116,7 +145,7 @@ function M.createPopup(initialContent, width, height)
     if content == nil then
       content = ''
     end
-    local lines = splitLines(content)
+    local lines = split_lines(content)
     vim.bo[bufnr].modifiable = true
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, true, lines)
     vim.bo[bufnr].modifiable = false
@@ -133,8 +162,7 @@ function M.createPopup(initialContent, width, height)
     col = 0,
   })
   vim.bo[bufnr].filetype = 'markdown'
-  vim.api.nvim_win_set_option(win_id, 'wrap', true)
-
+  vim.wo[win_id].wrap = true
 
   update(initialContent)
   if M.opts.result_popup_gets_focus then
@@ -143,61 +171,209 @@ function M.createPopup(initialContent, width, height)
   return update
 end
 
-function M.fill(tpl, args)
-  if tpl == nil then
-    tpl = ''
-  else
-    for key, value in pairs(args) do
-      local str_value = (value == nil) and '' or tostring(value)
-      local escaped_value = str_value:gsub('%%', '%%%%')
-      tpl = string.gsub(tpl, '%${' .. key .. '}', escaped_value)
-    end
-  end
-  return tpl
+-- Open a popup sized relative to the current window.
+local function show_in_popup(content, width_margin, height_margin)
+  local width = vim.fn.winwidth(0)
+  local height = vim.fn.winheight(0)
+  return M.createPopup(content, width - width_margin, height - height_margin)
 end
 
+local function show_config_error(message)
+  local err_msg = "# Configuration Error\n\n" .. message
+  common.log(err_msg)
+  show_in_popup(err_msg, 8, 4)
+end
 
-local providers = {
-  anthropic = anthropic,
-  googleai = googleai,
-  openai = openai,
-}
+-- ===== Model resolution =====
 
-local function queryProviderRunner(parsed_model, instruction, prompt_text, query_opts, scanned_files, heavy, common_opts)
-  local runner_mod = providers[parsed_model.provider]
-  local api_key = M.opts[parsed_model.provider .. '_api_key']
-  local agent_host = M.opts[parsed_model.provider .. '_agent_host']
-  local upload_url = common_opts.upload_url
-  local upload_token = common_opts.upload_token
-  local upload_as_public = common_opts.upload_as_public
+-- Parse a '<provider>/<model>' spec for `role` (plan, implement or reword).
+-- Returns the parsed model, or nil and an error message.
+local function parse_model(role, spec, prompt_name)
+  local parsed, err = common.parseModelSpec(spec)
+  if not parsed then
+    return nil, string.format("Invalid '%s' model for '%s': %s", role, prompt_name, err)
+  end
+  return parsed
+end
 
-  if heavy then
+-- Check the API key (and optionally the agent host) required by a parsed model.
+-- requirements = { agent_host = boolean }. Returns true, or nil and an error message.
+local function check_credentials(role, spec, parsed, requirements)
+  local provider = parsed.provider
+
+  local api_key = M.opts[provider .. '_api_key']
+  if not api_key or api_key == '' then
+    return nil, string.format(
+      "Missing API key for '%s' provider (`%s_api_key`) required by '%s' model '%s'.",
+      provider, provider, role, spec
+    )
+  end
+
+  if requirements.agent_host then
+    local agent_host = M.opts[provider .. '_agent_host']
+    if not agent_host or agent_host == '' then
+      return nil, string.format(
+        "Missing agent host for '%s' provider (`%s_agent_host`) required by '%s' model '%s'.",
+        provider, provider, role, spec
+      )
+    end
+  end
+
+  return true
+end
+
+-- Parse then check credentials. Returns the parsed model, or nil and an error message.
+local function resolve_model(role, spec, prompt_name, requirements)
+  local parsed, err = parse_model(role, spec, prompt_name)
+  if not parsed then
+    return nil, err
+  end
+  local ok, cred_err = check_credentials(role, spec, parsed, requirements)
+  if not ok then
+    return nil, cred_err
+  end
+  return parsed
+end
+
+-- Resolve and validate the models of a prompt. On failure the error is shown
+-- and nil is returned. Planning is enabled only when both 'plan' and 'reword'
+-- models are configured.
+local function resolve_pipeline_models(name, def)
+  local task_models = common.resolveTaskModels(def.models, M.opts.models)
+
+  local implement_spec = task_models.implement
+  if not implement_spec or implement_spec == '' then
+    show_config_error(string.format("No 'implement' model configured for command '%s'.", name))
+    return nil
+  end
+
+  local implement, err = resolve_model('implement', implement_spec, name, { agent_host = true })
+  if not implement then
+    show_config_error(err)
+    return nil
+  end
+
+  local result = { implement = implement, has_planning = false }
+
+  local plan_spec = task_models.plan
+  local reword_spec = task_models.reword
+  if plan_spec and reword_spec then
+    -- Phase 1: parse both specs.
+    local plan, plan_err = parse_model('plan', plan_spec, name)
+    if not plan then
+      show_config_error(plan_err)
+      return nil
+    end
+    local reword, reword_err = parse_model('reword', reword_spec, name)
+    if not reword then
+      show_config_error(reword_err)
+      return nil
+    end
+
+    -- Phase 2: credentials. 'plan' runs through the agent; 'reword' uses
+    -- askLight (direct API call), so it needs no agent host.
+    local ok, cred_err = check_credentials('plan', plan_spec, plan, { agent_host = true })
+    if not ok then
+      show_config_error(cred_err)
+      return nil
+    end
+    ok, cred_err = check_credentials('reword', reword_spec, reword, { agent_host = false })
+    if not ok then
+      show_config_error(cred_err)
+      return nil
+    end
+
+    result.plan = plan
+    result.reword = reword
+    result.has_planning = true
+  end
+
+  return result
+end
+
+-- ===== Pipeline helpers =====
+
+-- run = { parsed, instruction, prompt, query_opts, scanned_files, heavy }
+local function run_provider_query(run)
+  local parsed = run.parsed
+  local runner_mod = providers[parsed.provider]
+  local api_key = M.opts[parsed.provider .. '_api_key']
+  local agent_host = M.opts[parsed.provider .. '_agent_host']
+  local query_opts = run.query_opts
+
+  if run.heavy then
     runner_mod.askHeavy(
-      parsed_model.model,
-      instruction,
-      prompt_text,
+      parsed.model,
+      run.instruction,
+      run.prompt,
       query_opts,
       api_key,
       agent_host,
-      upload_url,
-      upload_token,
-      upload_as_public,
-      scanned_files
+      query_opts.upload_url,
+      query_opts.upload_token,
+      query_opts.upload_as_public,
+      run.scanned_files
     )
   else
     runner_mod.askLight(
-      parsed_model.model,
-      instruction,
-      prompt_text,
+      parsed.model,
+      run.instruction,
+      run.prompt,
       query_opts,
       api_key,
-      upload_url,
-      upload_token,
-      upload_as_public
+      query_opts.upload_url,
+      query_opts.upload_token,
+      query_opts.upload_as_public
     )
   end
 end
 
+-- NOTE: the Implement step only treats "# Agent Error" results as failures,
+-- whereas Plan and Reword also treat a plain "Error:" prefix as one. The
+-- asymmetry is intentional for now; deferred to a functional review.
+local function is_step_error(res, is_error, error_opts)
+  if is_error then
+    return true
+  end
+  if type(res) ~= 'string' then
+    return false
+  end
+  if vim.startswith(res, common.AGENT_ERROR_PREFIX) then
+    return true
+  end
+  if error_opts and error_opts.include_plain_errors then
+    return vim.startswith(res, "Error:")
+  end
+  return false
+end
+
+local PLAN_REWORD_ERROR_RULES = { include_plain_errors = true }
+local IMPLEMENT_ERROR_RULES = { include_plain_errors = false }
+
+-- Returns render_status(text): the status line plus the scanned-files table, if any.
+local function make_status_renderer(scanned_files_list)
+  local show_files_table = (scanned_files_list ~= nil and #scanned_files_list > 0)
+  local scanned_files_table = show_files_table and aiconfig.listScannedFilesAsFormattedTable(scanned_files_list) or ""
+
+  return function(status_text)
+    if show_files_table then
+      return status_text .. "\n\n" .. scanned_files_table
+    end
+    return status_text
+  end
+end
+
+local function log_pipeline_start(name, has_planning, scanned_files_list, original_prompt)
+  common.log("================================================================================")
+  common.log(string.format("[Pipeline] Starting command: '%s' (has_planning = %s)", name, tostring(has_planning)))
+  common.log(string.format("[Pipeline] Context files sent: %s", format_context_files(scanned_files_list)))
+  common.log(string.format("[Pipeline] User prompt:\n%s", original_prompt))
+  common.log("--------------------------------------------------------------------------------")
+end
+
+--- Run a prompt through the (optional plan, reword) and implement pipeline.
+---@param name string key in M.prompts
+---@param input string text given to the command
 function M.handle(name, input)
   local def = M.prompts[name]
   if not def then
@@ -205,8 +381,6 @@ function M.handle(name, input)
     return
   end
 
-  local width = vim.fn.winwidth(0)
-  local height = vim.fn.winheight(0)
   local args = {
     locale = M.opts.locale,
     alternate_locale = M.opts.alternate_locale,
@@ -214,145 +388,26 @@ function M.handle(name, input)
     input_encoded = vim.fn.json_encode(input),
   }
 
-  -- Resolve models for this prompt
-  local task_models = common.resolveTaskModels(def.models, M.opts.models)
-  local implement_spec = task_models.implement
-  local plan_spec = task_models.plan
-  local reword_spec = task_models.reword
-
-  -- Validate mandatory 'implement' model
-  if not implement_spec or implement_spec == '' then
-    local err_msg = string.format("# Configuration Error\n\nNo 'implement' model configured for command '%s'.", name)
-    common.log(err_msg)
-    local update = M.createPopup(err_msg, width - 8, height - 4)
-    update(err_msg)
+  local models = resolve_pipeline_models(name, def)
+  if not models then
     return
   end
-
-  local implement_parsed, implement_err = common.parseModelSpec(implement_spec)
-  if not implement_parsed then
-    local err_msg = string.format("# Configuration Error\n\nInvalid 'implement' model for '%s': %s", name, implement_err)
-    common.log(err_msg)
-    local update = M.createPopup(err_msg, width - 8, height - 4)
-    update(err_msg)
-    return
-  end
-
-  local implement_api_key = M.opts[implement_parsed.provider .. '_api_key']
-  if not implement_api_key or implement_api_key == '' then
-    local err_msg = string.format(
-      "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'implement' model '%s'.",
-      implement_parsed.provider, implement_parsed.provider, implement_spec
-    )
-    common.log(err_msg)
-    local update = M.createPopup(err_msg, width - 8, height - 4)
-    update(err_msg)
-    return
-  end
-
-  local implement_agent_host = M.opts[implement_parsed.provider .. '_agent_host']
-  if not implement_agent_host or implement_agent_host == '' then
-    local err_msg = string.format(
-      "# Configuration Error\n\nMissing agent host for '%s' provider (`%s_agent_host`) required by 'implement' model '%s'.",
-      implement_parsed.provider, implement_parsed.provider, implement_spec
-    )
-    common.log(err_msg)
-    local update = M.createPopup(err_msg, width - 8, height - 4)
-    update(err_msg)
-    return
-  end
-
-  -- Validate optional 'plan' and 'reword' models
-  -- Both must be present to enable planning; if either is absent/nil/disabled, planning is skipped.
-  local has_planning = false
-  local plan_parsed = nil
-  local reword_parsed = nil
-
-  if plan_spec and reword_spec then
-    local p_parsed, p_err = common.parseModelSpec(plan_spec)
-    if not p_parsed then
-      local err_msg = string.format("# Configuration Error\n\nInvalid 'plan' model for '%s': %s", name, p_err)
-      common.log(err_msg)
-      local update = M.createPopup(err_msg, width - 8, height - 4)
-      update(err_msg)
-      return
-    end
-
-    local r_parsed, r_err = common.parseModelSpec(reword_spec)
-    if not r_parsed then
-      local err_msg = string.format("# Configuration Error\n\nInvalid 'reword' model for '%s': %s", name, r_err)
-      common.log(err_msg)
-      local update = M.createPopup(err_msg, width - 8, height - 4)
-      update(err_msg)
-      return
-    end
-
-    local p_api_key = M.opts[p_parsed.provider .. '_api_key']
-    if not p_api_key or p_api_key == '' then
-      local err_msg = string.format(
-        "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'plan' model '%s'.",
-        p_parsed.provider, p_parsed.provider, plan_spec
-      )
-      common.log(err_msg)
-      local update = M.createPopup(err_msg, width - 8, height - 4)
-      update(err_msg)
-      return
-    end
-
-    local p_agent_host = M.opts[p_parsed.provider .. '_agent_host']
-    if not p_agent_host or p_agent_host == '' then
-      local err_msg = string.format(
-        "# Configuration Error\n\nMissing agent host for '%s' provider (`%s_agent_host`) required by 'plan' model '%s'.",
-        p_parsed.provider, p_parsed.provider, plan_spec
-      )
-      common.log(err_msg)
-      local update = M.createPopup(err_msg, width - 8, height - 4)
-      update(err_msg)
-      return
-    end
-
-    local r_api_key = M.opts[r_parsed.provider .. '_api_key']
-    if not r_api_key or r_api_key == '' then
-      local err_msg = string.format(
-        "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'reword' model '%s'.",
-        r_parsed.provider, r_parsed.provider, reword_spec
-      )
-      common.log(err_msg)
-      local update = M.createPopup(err_msg, width - 8, height - 4)
-      update(err_msg)
-      return
-    end
-
-    plan_parsed = p_parsed
-    reword_parsed = r_parsed
-    has_planning = true
-  end
+  local implement_parsed = models.implement
+  local plan_parsed = models.plan
+  local reword_parsed = models.reword
+  local has_planning = models.has_planning
 
   local scanned_files_list = aiconfig.listScannedFilesFromConfig()
-
-  local show_files_table = (scanned_files_list ~= nil and #scanned_files_list > 0)
-  local scanned_files_table = show_files_table and aiconfig.listScannedFilesAsFormattedTable(scanned_files_list) or ""
-
-  local function renderStatus(status_text)
-    local content = status_text
-    if show_files_table then
-      content = content .. "\n\n" .. scanned_files_table
-    end
-    return content
-  end
+  local render_status = make_status_renderer(scanned_files_list)
 
   local initial_status = has_planning
     and string.format("[1/3] Planning (%s)...", plan_parsed.full)
     or string.format("Implementing (%s)...", implement_parsed.full)
 
-  local update = M.createPopup(renderStatus(initial_status), width - 8, height - 4)
+  local update = show_in_popup(render_status(initial_status), 8, 4)
   local original_prompt = M.fill(def.prompt_tpl, args)
 
-  common.log("================================================================================")
-  common.log(string.format("[Pipeline] Starting command: '%s' (has_planning = %s)", name, tostring(has_planning)))
-  common.log(string.format("[Pipeline] Context files sent: %s", formatContextFiles(scanned_files_list)))
-  common.log(string.format("[Pipeline] User prompt:\n%s", original_prompt))
-  common.log("--------------------------------------------------------------------------------")
+  log_pipeline_start(name, has_planning, scanned_files_list, original_prompt)
 
   local common_query_opts = {
     upload_url = M.opts.upload_url,
@@ -360,58 +415,49 @@ function M.handle(name, input)
     upload_as_public = M.opts.upload_as_public,
   }
 
-  -- Step 3: Implement
-  local function executeImplement(final_implement_prompt)
-    if has_planning then
-      update(renderStatus(string.format("[3/3] Implementing (%s)...", implement_parsed.full)))
-      common.log(string.format("[Pipeline] === [3/3] Executing Implement (%s) ===", implement_parsed.full))
-      common.log(string.format("[Pipeline] Context files sent to Implement: %s", formatContextFiles(scanned_files_list)))
-      common.log(string.format("[Pipeline] Merged prompt+plan:\n%s", final_implement_prompt))
-    else
-      update(renderStatus(string.format("Implementing (%s)...", implement_parsed.full)))
-      common.log(string.format("[Pipeline] === Executing Implement directly (%s) ===", implement_parsed.full))
-      common.log(string.format("[Pipeline] Context files sent to Implement: %s", formatContextFiles(scanned_files_list)))
-      common.log(string.format("[Pipeline] Implement prompt:\n%s", final_implement_prompt))
-    end
+  -- Merge step-specific fields with the shared upload settings.
+  local function build_query_opts(fields)
+    return vim.tbl_extend('force', common_query_opts, fields)
+  end
 
-    local query_opts = {
-      raw_output = false,
-      handleResult = function(output)
-        args.output = output
-        args[implement_parsed.provider .. '_output'] = output
-        update(M.fill(def.result_tpl or '${output}', args))
-        return output
-      end,
+  local execute_plan, execute_reword, execute_implement
+
+  -- Step 1: Plan (only when has_planning is true)
+  execute_plan = function()
+    update(render_status(string.format("[1/3] Planning (%s)...", plan_parsed.full)))
+
+    common.log(string.format("[Pipeline] === [1/3] Executing Plan (%s) ===", plan_parsed.full))
+    common.log(string.format("[Pipeline] Context files sent to Plan: %s", format_context_files(scanned_files_list)))
+    common.log(string.format("[Pipeline] Plan prompt:\n%s", original_prompt))
+
+    local query_opts = build_query_opts({
+      raw_output = true,
+      handleResult = function(output) return output end,
       callback = function(res, is_error)
-        if is_error or (type(res) == 'string' and string.sub(res, 1, 13) == "# Agent Error") then
-          common.log(string.format("[Pipeline] Error during Implement step: %s", tostring(res)))
-          update(res)
-        else
-          common.log(string.format("[Pipeline] Implementation completed successfully from %s.", implement_parsed.full))
-          common.log("================================================================================")
+        if is_step_error(res, is_error, PLAN_REWORD_ERROR_RULES) then
+          common.log(string.format("[Pipeline] Error during Plan step: %s", tostring(res)))
+          update("# Error during Plan step\n\n" .. tostring(res))
+          return
         end
+
+        common.log(string.format("[Pipeline] Plan output received from %s:\n%s", plan_parsed.full, tostring(res)))
+        execute_reword(res)
       end,
-      upload_url = common_query_opts.upload_url,
-      upload_token = common_query_opts.upload_token,
-      upload_as_public = common_query_opts.upload_as_public,
-    }
+    })
 
-    local implement_prompt_with_rules = aiconfig.buildImplementPrompt(final_implement_prompt)
-
-    queryProviderRunner(
-      implement_parsed,
-      aiconfig.getSystemInstructions(),
-      implement_prompt_with_rules,
-      query_opts,
-      scanned_files_list,
-      true,
-      common_query_opts
-    )
+    run_provider_query({
+      parsed = plan_parsed,
+      instruction = aiconfig.getSystemInstructions(),
+      prompt = aiconfig.buildPlanPrompt(original_prompt),
+      query_opts = query_opts,
+      scanned_files = scanned_files_list,
+      heavy = true,
+    })
   end
 
   -- Step 2: Reword (only when has_planning is true)
-  local function executeReword(plan_text)
-    update(renderStatus(string.format("[2/3] Rewording plan (%s)...", reword_parsed.full)))
+  execute_reword = function(plan_text)
+    update(render_status(string.format("[2/3] Rewording plan (%s)...", reword_parsed.full)))
 
     local reword_prompt = string.format(
       "Original user request:\n%s\n\nPlan to execute:\n%s\n\n" ..
@@ -425,11 +471,11 @@ function M.handle(name, input)
     common.log(string.format("[Pipeline] Plan received to reword:\n%s", plan_text))
     common.log(string.format("[Pipeline] Reword prompt:\n%s", reword_prompt))
 
-    local query_opts = {
+    local query_opts = build_query_opts({
       raw_output = true,
       handleResult = function(output) return output end,
       callback = function(res, is_error)
-        if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
+        if is_step_error(res, is_error, PLAN_REWORD_ERROR_RULES) then
           common.log(string.format("[Pipeline] Error during Reword step: %s", tostring(res)))
           update("# Error during Reword step\n\n" .. tostring(res))
           return
@@ -437,90 +483,83 @@ function M.handle(name, input)
 
         common.log(string.format("[Pipeline] Reword output received from %s:\n%s", reword_parsed.full, tostring(res)))
 
-        local combined_implement_prompt = original_prompt .. "\n\n### Implementation Plan & Instructions:\n" .. res
-        executeImplement(combined_implement_prompt)
+        execute_implement(original_prompt .. "\n\n### Implementation Plan & Instructions:\n" .. res)
       end,
-      upload_url = common_query_opts.upload_url,
-      upload_token = common_query_opts.upload_token,
-      upload_as_public = common_query_opts.upload_as_public,
-    }
+    })
 
-    queryProviderRunner(
-      reword_parsed,
-      aiconfig.getRewordInstructions(),
-      reword_prompt,
-      query_opts,
-      nil,
-      false,
-      common_query_opts
-    )
+    run_provider_query({
+      parsed = reword_parsed,
+      instruction = aiconfig.getRewordInstructions(),
+      prompt = reword_prompt,
+      query_opts = query_opts,
+      scanned_files = nil,
+      heavy = false,
+    })
   end
 
-  -- Step 1: Plan (only when has_planning is true)
-  local function executePlan()
-    update(renderStatus(string.format("[1/3] Planning (%s)...", plan_parsed.full)))
+  -- Step 3: Implement (the only step when planning is skipped)
+  execute_implement = function(final_implement_prompt)
+    if has_planning then
+      update(render_status(string.format("[3/3] Implementing (%s)...", implement_parsed.full)))
+      common.log(string.format("[Pipeline] === [3/3] Executing Implement (%s) ===", implement_parsed.full))
+      common.log(string.format("[Pipeline] Context files sent to Implement: %s", format_context_files(scanned_files_list)))
+      common.log(string.format("[Pipeline] Merged prompt+plan:\n%s", final_implement_prompt))
+    else
+      update(render_status(string.format("Implementing (%s)...", implement_parsed.full)))
+      common.log(string.format("[Pipeline] === Executing Implement directly (%s) ===", implement_parsed.full))
+      common.log(string.format("[Pipeline] Context files sent to Implement: %s", format_context_files(scanned_files_list)))
+      common.log(string.format("[Pipeline] Implement prompt:\n%s", final_implement_prompt))
+    end
 
-    common.log(string.format("[Pipeline] === [1/3] Executing Plan (%s) ===", plan_parsed.full))
-    common.log(string.format("[Pipeline] Context files sent to Plan: %s", formatContextFiles(scanned_files_list)))
-    common.log(string.format("[Pipeline] Plan prompt:\n%s", original_prompt))
-
-    local query_opts = {
-      raw_output = true,
-      handleResult = function(output) return output end,
-      callback = function(res, is_error)
-        if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
-          common.log(string.format("[Pipeline] Error during Plan step: %s", tostring(res)))
-          update("# Error during Plan step\n\n" .. tostring(res))
-          return
-        end
-
-        common.log(string.format("[Pipeline] Plan output received from %s:\n%s", plan_parsed.full, tostring(res)))
-        executeReword(res)
+    local query_opts = build_query_opts({
+      raw_output = false,
+      handleResult = function(output)
+        args.output = output
+        args[implement_parsed.provider .. '_output'] = output
+        update(M.fill(def.result_tpl or '${output}', args))
+        return output
       end,
-      upload_url = common_query_opts.upload_url,
-      upload_token = common_query_opts.upload_token,
-      upload_as_public = common_query_opts.upload_as_public,
-    }
+      callback = function(res, is_error)
+        if is_step_error(res, is_error, IMPLEMENT_ERROR_RULES) then
+          common.log(string.format("[Pipeline] Error during Implement step: %s", tostring(res)))
+          update(res)
+        else
+          common.log(string.format("[Pipeline] Implementation completed successfully from %s.", implement_parsed.full))
+          common.log("================================================================================")
+        end
+      end,
+    })
 
-    local plan_prompt_with_rules = aiconfig.buildPlanPrompt(original_prompt)
-
-    queryProviderRunner(
-      plan_parsed,
-      aiconfig.getSystemInstructions(),
-      plan_prompt_with_rules,
-      query_opts,
-      scanned_files_list,
-      true,
-      common_query_opts
-    )
+    run_provider_query({
+      parsed = implement_parsed,
+      instruction = aiconfig.getSystemInstructions(),
+      prompt = aiconfig.buildImplementPrompt(final_implement_prompt),
+      query_opts = query_opts,
+      scanned_files = scanned_files_list,
+      heavy = true,
+    })
   end
 
   if has_planning then
-    executePlan()
+    execute_plan()
   else
     common.log("[Pipeline] Planning stage skipped (plan or reword model not specified).")
-    executeImplement(original_prompt)
+    execute_implement(original_prompt)
   end
 end
 
 function M.rewordPrompt(input)
-  local width = vim.fn.winwidth(0)
-  local height = vim.fn.winheight(0)
-  local update = M.createPopup("Rewording prompt with Ollama...", width - 8, height - 4)
+  local update = show_in_popup("Rewording prompt with Ollama...", 8, 4)
 
   ollama_reword.reword(input, M.opts, function(result)
     update(result)
   end)
 end
 
-function M.assign(table, other)
-  for k, v in pairs(other) do
-    table[k] = v
-  end
-  return table
-end
+-- ===== Setup =====
 
-function M.setup(opts)
+-- Merge user options into M.opts; 'prompts' extends the default prompts.
+local function merge_options(opts)
   for k, v in pairs(opts) do
     if k == 'prompts' then
       M.prompts = {}
@@ -530,11 +569,14 @@ function M.setup(opts)
       M.opts[k] = v
     end
   end
+end
+
+local function register_prompt_commands()
   for k, v in pairs(M.prompts) do
     if v.command then
       vim.api.nvim_create_user_command(v.command, function(args)
         local text = args['args']
-        if isEmpty(text) then
+        if is_empty(text) then
           text = M.getSelectedText(true)
         end
         if not v.require_input or M.hasLetters(text) then
@@ -543,11 +585,15 @@ function M.setup(opts)
       end, { range = true, nargs = '?' })
     end
   end
+end
 
-  -- Check provider API keys and agent hosts for any models configured globally or per-prompt
+-- Log a warning for every referenced provider that lacks an API key, and for
+-- every plan/implement provider that lacks an agent host.
+local function warn_about_missing_credentials()
   local referenced_providers = {}
   local agent_providers = {}
-  local function collectProviders(models_def)
+
+  local function collect_providers(models_def)
     if type(models_def) ~= 'table' then return end
     local task_models = common.resolveTaskModels(models_def, nil)
     for task, spec in pairs(task_models) do
@@ -561,9 +607,9 @@ function M.setup(opts)
     end
   end
 
-  collectProviders(M.opts.models)
+  collect_providers(M.opts.models)
   for _, prompt_def in pairs(M.prompts) do
-    collectProviders(prompt_def.models)
+    collect_providers(prompt_def.models)
   end
 
   for provider, _ in pairs(referenced_providers) do
@@ -579,10 +625,12 @@ function M.setup(opts)
       common.log("Warning: " .. provider .. " agent host (" .. provider .. "_agent_host) is not configured; plan/implement calls using this provider will fail.")
     end
   end
+end
 
+local function register_utility_commands()
   vim.api.nvim_create_user_command('AIRewordPrompt', function(args)
     local text = args['args']
-    if isEmpty(text) then
+    if is_empty(text) then
       text = M.getSelectedText(true)
     end
     if M.hasLetters(text) then
@@ -591,22 +639,23 @@ function M.setup(opts)
   end, { range = true, nargs = '?' })
 
   vim.api.nvim_create_user_command('AIListScannedFiles', function()
-    local width = vim.fn.winwidth(0)
-    local height = vim.fn.winheight(0)
-    local scanned_files = aiconfig.listScannedFilesAsFormattedTable()
-    local update = M.createPopup(scanned_files, width - 12, height - 8)
-    update(scanned_files)
+    show_in_popup(aiconfig.listScannedFilesAsFormattedTable(), 12, 8)
   end, {})
 
   vim.api.nvim_create_user_command('AIShowSystemInstructions', function()
-    local width = vim.fn.winwidth(0)
-    local height = vim.fn.winheight(0)
-    local instructions = aiconfig.getSystemInstructions()
-    local update = M.createPopup(instructions, width - 12, height - 8)
-    update(instructions)
+    show_in_popup(aiconfig.getSystemInstructions(), 12, 8)
   end, {})
 end
 
+---@param opts table user options (see M.opts for the available keys)
+function M.setup(opts)
+  merge_options(opts)
+  register_prompt_commands()
+  warn_about_missing_credentials()
+  register_utility_commands()
+end
+
+-- Close the result popup as soon as the cursor moves.
 vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI' }, {
   callback = M.close,
 })

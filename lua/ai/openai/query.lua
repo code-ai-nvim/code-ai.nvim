@@ -3,30 +3,52 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a provider-specific effort level suffix.
--- The project treats effort levels uniformly: split on the `:` separator,
--- keep the base model id, and map the suffix to the provider's valid API field
--- when it is recognized. For OpenAI, accepted reasoning values are `low`,
--- `medium`, `high`, `xhigh`, `max`, and `none` (where supported).
--- Models without a `:` separator or with an unrecognized suffix are passed
--- through unchanged so model existence can be validated by the upstream API.
-local function normalizeOpenAIModel(model)
-  local base_model, suffix = model:match('^(.+):(.+)$')
+-- Valid OpenAI `reasoning.effort` values (`none` only where the model supports it).
+local REASONING_EFFORTS = { low = true, medium = true, high = true, xhigh = true, max = true, none = true }
 
-  if not base_model or not suffix then
-    return { model = model }
-  end
+-- Split an optional effort suffix off the model id (see common.splitModelSuffix).
+-- Recognized suffixes map to `reasoning.effort`. Unrecognized suffixes are passed
+-- through so the upstream API can validate them.
+local function normalize_model(model)
+  local base_model, suffix = common.splitModelSuffix(model)
 
-  if suffix == 'low'
-      or suffix == 'medium'
-      or suffix == 'high'
-      or suffix == 'xhigh'
-      or suffix == 'max'
-      or suffix == 'none' then
+  if suffix ~= nil and REASONING_EFFORTS[suffix] then
     return { model = base_model, reasoning_effort = suffix }
   end
 
   return { model = model }
+end
+
+-- Append `value` to `out` when it is a non-empty string.
+local function append_text(out, value)
+  if type(value) == 'string' and value ~= '' then
+    table.insert(out, value)
+  end
+end
+
+-- Parts may be tables ({ text } or { value }) or bare strings.
+local function append_content_parts(out, content)
+  for _, part in ipairs(content) do
+    if type(part) == 'table' then
+      append_text(out, part.text or part.value)
+    else
+      append_text(out, part)
+    end
+  end
+end
+
+local function append_output_item(out, item)
+  if type(item) ~= 'table' then
+    append_text(out, item)
+    return
+  end
+
+  append_text(out, item.text)
+  if type(item.content) == 'table' then
+    append_content_parts(out, item.content)
+  else
+    append_text(out, item.content)
+  end
 end
 
 local openai_runner = provider.createQueryRunner({
@@ -52,12 +74,10 @@ local openai_runner = provider.createQueryRunner({
       ['Authorization'] = 'Bearer ' .. api_key,
     }
   end,
-  -- `messages` is an ordered array of { role = "user"|"assistant", content = "..." }
-  -- built by ai.conversation.build(). We map it directly into OpenAI's `input` array
-  -- with plain string content, matching wire-for-wire what openai-agent's
-  -- buildRequestBody() sends today (conversationMessages.map(({role, content}) => ({role, content}))).
+  -- `messages` (from ai.conversation.build()) maps directly into OpenAI's `input`
+  -- array with plain string content, matching openai-agent's buildRequestBody().
   build_request_body = function(model, instruction, messages)
-    local normalized = normalizeOpenAIModel(model)
+    local normalized = normalize_model(model)
     local input_messages = {}
     for _, message in ipairs(messages or {}) do
       table.insert(input_messages, {
@@ -84,40 +104,21 @@ local openai_runner = provider.createQueryRunner({
     local usage = type(data.usage) == 'table' and data.usage or {}
     return usage.input_tokens or 0, usage.output_tokens or 0
   end,
+  -- Collect `output_text` first, then every text found in `output[]`, joined by a blank line.
   extract_content = function(data)
     local out = {}
 
-    if type(data.output_text) == 'string' and data.output_text ~= '' then
-      table.insert(out, data.output_text)
-    elseif type(data.output_text) == 'table' then
-      for _, s in ipairs(data.output_text) do
-        if type(s) == 'string' and s ~= '' then table.insert(out, s) end
+    if type(data.output_text) == 'table' then
+      for _, text in ipairs(data.output_text) do
+        append_text(out, text)
       end
+    else
+      append_text(out, data.output_text)
     end
 
     if type(data.output) == 'table' then
       for _, item in ipairs(data.output) do
-        if type(item) == 'table' then
-          if type(item.text) == 'string' and item.text ~= '' then
-            table.insert(out, item.text)
-          end
-          if type(item.content) == 'table' then
-            for _, part in ipairs(item.content) do
-              if type(part) == 'table' then
-                local t = part.text or part.value
-                if type(t) == 'string' and t ~= '' then
-                  table.insert(out, t)
-                end
-              elseif type(part) == 'string' and part ~= '' then
-                table.insert(out, part)
-              end
-            end
-          elseif type(item.content) == 'string' and item.content ~= '' then
-            table.insert(out, item.content)
-          end
-        elseif type(item) == 'string' and item ~= '' then
-          table.insert(out, item)
-        end
+        append_output_item(out, item)
       end
     end
 
@@ -147,12 +148,7 @@ local openai_runner = provider.createQueryRunner({
   end
 })
 
-function query.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-  openai_runner.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-end
-
-function query.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-  openai_runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-end
+query.askHeavy = openai_runner.askHeavy
+query.askLight = openai_runner.askLight
 
 return query

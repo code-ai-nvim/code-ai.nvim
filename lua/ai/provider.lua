@@ -6,9 +6,13 @@ local conversation = require('ai.conversation')
 
 local M = {}
 
+-- ===== Constants =====
+
 -- Light-mode requests carrying embedded project files may take longer than a
 -- bare-prompt light request; give them a generous timeout (in milliseconds).
 local LIGHT_REQUEST_TIMEOUT_MS = 120000
+
+-- ===== Helpers =====
 
 -- Build the project_context array ({ filename, content }) from a list of
 -- scanned file relative paths for askHeavy.
@@ -41,26 +45,64 @@ local function build_project_context(scanned_files_list)
   return project_context
 end
 
--- Create a generic query runner for a provider
-function M.createQueryRunner(config)
-  -- config requires:
-  --   name: string (e.g. "Anthropic", "GoogleAI", "OpenAI")
-  --   title_tag: string (e.g. "ANT", "GGL", "OPN")
-  --   history_prefix: string (e.g. "anthropic_", "googleai_", "openai_")
-  --   disabled_response: table
-  --   api_host: string
-  --   api_path: string (used unless build_url is provided)
-  --   build_url: function(api_host, api_key, model) -> string (optional; when
-  --     provided, overrides api_path-based URL construction, used by
-  --     providers whose REST endpoint embeds the model id and/or API key
-  --     directly in the URL, e.g. GoogleAI's `:generateContent?key=...`)
-  --   build_headers: function(api_key, model) -> table
-  --   build_request_body: function(model, instruction, messages) -> table
-  --   extract_usage: function(data) -> input_tokens, output_tokens
-  --   extract_content: function(data) -> string
-  --   format_error: function(status, body) -> string
+-- Options handed to common.askCallback / common.askHeavy.
+-- `upload` is { url, token, is_public }.
+local function make_callback_opts(opts, upload)
+  return {
+    handleResult = opts.handleResult,
+    callback = opts.callback,
+    upload_url = upload.url,
+    upload_token = upload.token,
+    upload_as_public = upload.is_public,
+    stats = opts.stats,
+    raw_output = opts.raw_output,
+  }
+end
 
+-- Send accumulated stats (if any) exactly once, then clear them.
+local function flush_stats(opts, input_tokens, output_tokens)
+  if opts and opts.stats then
+    common.sendIngestionStats(opts.stats, input_tokens, output_tokens)
+    opts.stats = nil
+  end
+end
+
+-- ===== Query runner =====
+
+---@class ProviderConfig
+---@field name string Display name (e.g. "Anthropic", "GoogleAI", "OpenAI")
+---@field title_tag string Short tag inserted in result titles (e.g. "ANT", "GGL", "OPN")
+---@field history_prefix string Prefix of history entries (e.g. "anthropic_")
+---@field disabled_response table Fake API response used when the model is "disabled"
+---@field api_host string Base URL of the provider API
+---@field api_path string|nil Path appended to api_host (alternative to build_url)
+---@field build_url (fun(api_host: string, api_key: string, model: string): string)|nil
+---  Full URL builder (alternative to api_path), for providers whose REST endpoint
+---  embeds the model id and/or API key in the URL (e.g. GoogleAI's `:generateContent?key=...`)
+---@field build_headers fun(api_key: string, model: string): table
+---@field build_request_body fun(model: string, instruction: string, messages: table[]): table
+---@field validate_data (fun(data: table): string|nil)|nil Returns an error string when the response is unusable
+---@field extract_usage fun(data: table): number, number Returns input_tokens, output_tokens
+---@field extract_content fun(data: table): string
+---@field format_error fun(status: number, body: string): string
+
+--- Create a generic query runner for a provider.
+---@param config ProviderConfig
+function M.createQueryRunner(config)
   local runner = {}
+
+  local function format_footer(model_used, input_tokens, output_tokens)
+    return '\n\n'
+      .. config.name .. ' ' .. model_used
+      .. ' (' .. common.formatTokenCount(input_tokens) .. ' in, ' .. common.formatTokenCount(output_tokens) .. ' out)\n\n'
+  end
+
+  -- Save history and upload the formatted result.
+  local function persist_result(model_used, prompt_to_save, result, upload)
+    history.saveToHistory(config.history_prefix .. model_used, prompt_to_save .. '\n\n' .. result)
+    local model_label = config.name .. ' (' .. model_used .. ')'
+    common.uploadContent(upload.url, upload.token, result, model_label, upload.is_public)
+  end
 
   function runner.formatResult(data, upload_url, upload_token, upload_as_public, opts, model_used, prompt_to_save)
     common.log("Inside " .. config.name .. " formatResult")
@@ -73,35 +115,20 @@ function M.createQueryRunner(config)
     end
 
     local input_tokens, output_tokens = config.extract_usage(data)
-    local formatted_input_tokens = common.formatTokenCount(input_tokens)
-    local formatted_output_tokens = common.formatTokenCount(output_tokens)
-
     local content_text = config.extract_content(data)
 
     if opts and opts.raw_output then
-      if opts.stats then
-        common.sendIngestionStats(opts.stats, input_tokens, output_tokens)
-        opts.stats = nil
-      end
+      flush_stats(opts, input_tokens, output_tokens)
       return content_text, false
     end
 
-    local result = content_text
-      .. '\n\n'
-      .. config.name .. ' ' .. model_used
-      .. ' (' .. formatted_input_tokens .. ' in, ' .. formatted_output_tokens .. ' out)\n\n'
-
+    local result = content_text .. format_footer(model_used, input_tokens, output_tokens)
     result = common.insertWordToTitle(config.title_tag, result)
 
     if model_used ~= 'disabled' then
-      history.saveToHistory(config.history_prefix .. model_used, prompt_to_save .. '\n\n' .. result)
-      local model_label = config.name .. ' (' .. model_used .. ')'
-      common.uploadContent(upload_url, upload_token, result, model_label, upload_as_public)
-
-      if opts and opts.stats then
-        common.sendIngestionStats(opts.stats, input_tokens, output_tokens)
-        opts.stats = nil
-      end
+      local upload = { url = upload_url, token = upload_token, is_public = upload_as_public }
+      persist_result(model_used, prompt_to_save, result, upload)
+      flush_stats(opts, input_tokens, output_tokens)
     else
       common.log(config.name .. " model is disabled: skipping history save and upload.")
     end
@@ -128,6 +155,17 @@ function M.createQueryRunner(config)
     )
   end
 
+  -- Answer a "disabled" model with the provider's canned response.
+  local function answer_disabled(model, prompt, opts, upload)
+    common.handleDisabledModel(
+      make_callback_opts(opts, upload),
+      function(res, cb_opts)
+        runner.askCallback(res, cb_opts, model, prompt)
+      end,
+      config.disabled_response
+    )
+  end
+
   -- Build and dispatch a provider-specific markdown error string directly through
   -- opts.callback, bypassing formatResult/history/upload entirely. Mirrors the
   -- error path already used by common.askHeavy for chunk-transmission failures.
@@ -135,27 +173,27 @@ function M.createQueryRunner(config)
     common.log(config.name .. " askHeavy aborted: " .. message)
     if opts.callback ~= nil then
       vim.schedule(function()
-        opts.callback("# Agent Error\n\n" .. message, true)
+        opts.callback(common.AGENT_ERROR_PREFIX .. "\n\n" .. message, true)
       end)
     end
   end
 
+  -- Some providers (e.g. GoogleAI's `:generateContent` method) need the
+  -- model id and/or API key embedded directly in the URL rather than a
+  -- fixed path + header. When config.build_url is provided, use it;
+  -- otherwise fall back to the historical static api_host .. api_path.
+  local function resolve_url(api_key, model)
+    if config.build_url then
+      return config.build_url(config.api_host, api_key, model)
+    end
+    return config.api_host .. config.api_path
+  end
+
   function runner.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
+    local upload = { url = upload_url, token = upload_token, is_public = upload_as_public }
+
     if model == "disabled" then
-      common.handleDisabledModel(config.name, model,
-        {
-          handleResult = opts.handleResult,
-          callback = opts.callback,
-          upload_url = upload_url,
-          upload_token = upload_token,
-          upload_as_public = upload_as_public,
-          raw_output = opts.raw_output,
-        },
-        function(res, cb_opts)
-          runner.askCallback(res, cb_opts, model, prompt)
-        end,
-        config.disabled_response
-      )
+      answer_disabled(model, prompt, opts, upload)
       return
     end
 
@@ -170,6 +208,7 @@ function M.createQueryRunner(config)
       return
     end
 
+    -- Fallback for callers that don't pre-scan the project files.
     local scanned_files_list = scanned_files or aiconfig.listScannedFilesFromConfig()
     local project_context = build_project_context(scanned_files_list)
 
@@ -187,15 +226,7 @@ function M.createQueryRunner(config)
       instruction,
       prompt,
       project_context,
-      {
-        handleResult = opts.handleResult,
-        callback = opts.callback,
-        upload_url = upload_url,
-        upload_token = upload_token,
-        upload_as_public = upload_as_public,
-        stats = opts.stats,
-        raw_output = opts.raw_output,
-      },
+      make_callback_opts(opts, upload),
       function(res, cb_opts)
         runner.askCallback(res, cb_opts, model, prompt)
       end
@@ -203,21 +234,10 @@ function M.createQueryRunner(config)
   end
 
   function runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
+    local upload = { url = upload_url, token = upload_token, is_public = upload_as_public }
+
     if model == "disabled" then
-      common.handleDisabledModel(config.name, model,
-        {
-          handleResult = opts.handleResult,
-          callback = opts.callback,
-          upload_url = upload_url,
-          upload_token = upload_token,
-          upload_as_public = upload_as_public,
-          raw_output = opts.raw_output,
-        },
-        function(res, cb_opts)
-          runner.askCallback(res, cb_opts, model, prompt)
-        end,
-        config.disabled_response
-      )
+      answer_disabled(model, prompt, opts, upload)
       return
     end
 
@@ -232,17 +252,7 @@ function M.createQueryRunner(config)
 
     local request_body = config.build_request_body(model, instruction, messages)
     local headers = config.build_headers(api_key, model)
-
-    -- Some providers (e.g. GoogleAI's `:generateContent` method) need the
-    -- model id and/or API key embedded directly in the URL rather than a
-    -- fixed path + header. When config.build_url is provided, use it;
-    -- otherwise fall back to the historical static api_host .. api_path.
-    local url
-    if config.build_url then
-      url = config.build_url(config.api_host, api_key, model)
-    else
-      url = config.api_host .. config.api_path
-    end
+    local url = resolve_url(api_key, model)
 
     local success, err = pcall(function()
       curl.post(url, {
@@ -252,15 +262,7 @@ function M.createQueryRunner(config)
         callback = function(res)
           common.log("Before " .. config.name .. " callback call")
           vim.schedule(function()
-            runner.askCallback(res, {
-              handleResult = opts.handleResult,
-              callback = opts.callback,
-              upload_url = upload_url,
-              upload_token = upload_token,
-              upload_as_public = upload_as_public,
-              stats = opts.stats,
-              raw_output = opts.raw_output,
-            }, model, prompt)
+            runner.askCallback(res, make_callback_opts(opts, upload), model, prompt)
           end)
         end
       })
@@ -281,4 +283,3 @@ function M.createQueryRunner(config)
 end
 
 return M
-

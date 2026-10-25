@@ -1,3 +1,5 @@
+-- Lua port of `lua-glob-pattern` by David Manura (glob -> Lua pattern conversion).
+-- This is vendored code, intentionally kept close to upstream; avoid restructuring it.
 local M = {}
 
 function M.globtopattern(g)
@@ -29,7 +31,7 @@ function M.globtopattern(g)
 
   -- Convert tokens at end of charset.
   local function charset_end()
-    while 1 do
+    while true do
       if c == '' then
         p = '[^]'
         return false
@@ -90,7 +92,7 @@ function M.globtopattern(g)
   end
 
   -- Convert tokens.
-  while 1 do
+  while true do
     i = i + 1; c = g:sub(i,i)
     if c == '' then
       p = p .. '$'

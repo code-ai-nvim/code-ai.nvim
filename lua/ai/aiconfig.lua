@@ -2,33 +2,9 @@ local aiconfig = {}
 local common = require("ai.common")
 local globpattern = require("ai.globpattern")
 
-function aiconfig.findSystemInstructionsFile()
-  local path = vim.fn.getcwd() .. '/.ai-system-instructions.md'
-  if vim.fn.filereadable(path) == 1 then
-    return path
-  else
-    return ""
-  end
-end
+-- ===== Prompt rules =====
 
 local DEFAULT_SYSTEM_INSTRUCTIONS = "You are an expert software engineer and coding assistant."
-
-function aiconfig.getSystemInstructions()
-  local user_instructions_path = aiconfig.findSystemInstructionsFile()
-  local content = ""
-  if user_instructions_path ~= "" then
-    local lines = vim.fn.readfile(user_instructions_path)
-    if lines and #lines > 0 then
-      content = table.concat(lines, "\n")
-    else
-      common.log("Could not read user system instructions or file is empty: " .. user_instructions_path)
-    end
-  end
-  if vim.trim(content) == "" then
-    return DEFAULT_SYSTEM_INSTRUCTIONS
-  end
-  return content
-end
 
 local PLAN_RULES = [[
 # Plan Generation Rules
@@ -51,12 +27,66 @@ local IMPLEMENT_RULES = [[
 - HARD CONSTRAINT: NEVER return diffs, git patches, or isolated code chunks. You must output the complete file contents for every file.
 ]]
 
-function aiconfig.getPlanInstructions()
-  return aiconfig.getSystemInstructions()
+-- ===== Config file lookup =====
+
+-- Path of `filename` in the current working directory, or "" when not readable.
+local function find_in_cwd(filename)
+  local path = vim.fn.getcwd() .. '/' .. filename
+  if vim.fn.filereadable(path) == 1 then
+    return path
+  end
+  return ""
 end
 
+function aiconfig.findSystemInstructionsFile()
+  return find_in_cwd('.ai-system-instructions.md')
+end
+
+function aiconfig.findScannedFilesConfig()
+  return find_in_cwd('.ai-scanned-files')
+end
+
+-- ===== System instructions and prompt builders =====
+
+---@return string
+function aiconfig.getSystemInstructions()
+  local user_instructions_path = aiconfig.findSystemInstructionsFile()
+  local content = ""
+  if user_instructions_path ~= "" then
+    local lines = vim.fn.readfile(user_instructions_path)
+    if lines and #lines > 0 then
+      content = table.concat(lines, "\n")
+    else
+      common.log("Could not read user system instructions or file is empty: " .. user_instructions_path)
+    end
+  end
+  if vim.trim(content) == "" then
+    return DEFAULT_SYSTEM_INSTRUCTIONS
+  end
+  return content
+end
+
+---@return string
 function aiconfig.getRewordInstructions()
   return REWORD_RULES
+end
+
+---@param prompt string|nil
+---@return string
+function aiconfig.buildPlanPrompt(prompt)
+  return (prompt or "") .. "\n\n" .. PLAN_RULES
+end
+
+---@param prompt string|nil
+---@return string
+function aiconfig.buildImplementPrompt(prompt)
+  return (prompt or "") .. "\n\n" .. IMPLEMENT_RULES
+end
+
+-- ===== Public accessors (currently unused internally) =====
+
+function aiconfig.getPlanInstructions()
+  return aiconfig.getSystemInstructions()
 end
 
 function aiconfig.getImplementInstructions()
@@ -71,153 +101,6 @@ function aiconfig.getImplementRules()
   return IMPLEMENT_RULES
 end
 
-function aiconfig.buildPlanPrompt(prompt)
-  return (prompt or "") .. "\n\n" .. PLAN_RULES
-end
-
-function aiconfig.buildImplementPrompt(prompt)
-  return (prompt or "") .. "\n\n" .. IMPLEMENT_RULES
-end
-
-function aiconfig.findScannedFilesConfig()
-  local path = vim.fn.getcwd() .. '/.ai-scanned-files'
-  if vim.fn.filereadable(path) == 1 then
-    return path
-  else
-    return ""
-  end
-end
-
-function aiconfig.getProjectRoot()
-  -- To find the project root, we look upward for several files or directory, in this order:
-  -- 1. The .ai-scanned-files file
-  -- 2. The .git directory
-  -- 3. The .gitignore file
-  -- 4. The README.md file
-
-  local project_root = vim.fn.getcwd() -- Start with the current working directory
-  -- Check if the .ai-scanned-files file exists here or in any parent directory
-  local configFile = aiconfig.findScannedFilesConfig()
-  if configFile ~= "" then
-    project_root = vim.fn.fnamemodify(configFile, ":h") -- Get the parent directory of the .ai-scanned-files file
-    return project_root
-  end
-
-  -- Check if the .git directory exists here or in any parent directory
-  local gitDir = vim.fn.finddir(".git", ".;") -- Find the .git directory
-  if gitDir ~= "" then
-    project_root = vim.fn.fnamemodify(gitDir, ":h") -- Get the parent directory of the .git directory
-    return project_root
-  end
-
-  -- Check if the .gitignore file exists here or in any parent directory
-  local gitignoreFile = vim.fn.findfile(".gitignore", ".;") -- Find the .gitignore file
-  if gitignoreFile ~= "" then
-    project_root = vim.fn.fnamemodify(gitignoreFile, ":h") -- Get the parent directory of the .gitignore file
-    return project_root
-  end
-
-  -- Check if the README.md file exists here or in any parent directory
-  local readmeFile = vim.fn.findfile("README.md", ".;") -- Find the README.md file
-  if readmeFile ~= "" then
-    project_root = vim.fn.fnamemodify(readmeFile, ":h") -- Get the parent directory of the README.md file
-    return project_root
-  end
-  return project_root
-end
-
-function aiconfig.listScannedFilesFromConfig()
-  local config_path = aiconfig.findScannedFilesConfig()
-  if config_path == "" then
-    common.log("No .ai-scanned-files config found.")
-    return {}
-  end
-
-  local include_glob_patterns = {}
-  local exclude_glob_patterns = {}
-
-  common.log("Reading scanned files config: " .. config_path)
-  local lines = vim.fn.readfile(config_path)
-  if not lines or #lines == 0 then
-    common.log("Config file is empty or could not be read: " .. config_path)
-    return {}
-  end
-
-  for _, line in ipairs(lines) do
-    local trimmed_line = vim.trim(line)
-    if #trimmed_line > 1 then -- Ignore empty or single character lines
-        if vim.startswith(trimmed_line, "+") then
-          local pattern = trimmed_line:sub(2)
-          table.insert(include_glob_patterns, pattern)
-          common.log("Include glob pattern: " .. pattern)
-        elseif vim.startswith(trimmed_line, "-") then
-          local pattern = trimmed_line:sub(2)
-          table.insert(exclude_glob_patterns, pattern)
-          common.log("Exclude glob pattern: " .. pattern)
-        end
-    end
-  end
-
-  local exclude_lua_patterns = {}
-  for _, pattern in ipairs(exclude_glob_patterns) do
-    local lua_pattern = globpattern.globtopattern(pattern)
-    table.insert(exclude_lua_patterns, lua_pattern)
-    common.log("Converted exclude glob '" .. pattern .. "' to Lua pattern: " .. lua_pattern)
-  end
-
-  local files_with_sizes = {}
-  local processed_files = {}
-  local project_root = aiconfig.getProjectRoot()
-
-  for _, include_pattern in ipairs(include_glob_patterns) do
-    common.log("Processing include glob pattern: " .. include_pattern)
-    local potential_files = vim.fn.glob(project_root .. '/' .. include_pattern, false, true)
-
-    for _, full_path in ipairs(potential_files) do
-      local relative_path = string.sub(full_path, #project_root + 2)
-
-      if not processed_files[relative_path] then
-        local is_excluded = false
-        for _, exclude_pattern_lua in ipairs(exclude_lua_patterns) do
-          if string.match(relative_path, exclude_pattern_lua) then
-            is_excluded = true
-            common.log("File '" .. relative_path .. "' excluded by pattern: " .. exclude_pattern_lua)
-            break
-          end
-        end
-
-        if not is_excluded then
-          local file_info = vim.loop.fs_stat(full_path)
-          if file_info and file_info.type == 'file' then
-            table.insert(files_with_sizes, {
-              path = relative_path,
-              size = file_info.size
-            })
-            processed_files[relative_path] = true
-            common.log("File '" .. relative_path .. "' included (Size: " .. file_info.size .. ")")
-          else
-             common.log("Path '" .. relative_path .. "' is not a file or stat failed, skipping.")
-          end
-        end
-      else
-        common.log("File '" .. relative_path .. "' already processed, skipping duplicate.")
-      end
-    end
-  end
-
-  table.sort(files_with_sizes, function(a, b)
-    return a.size > b.size
-  end)
-
-  local final_files = {}
-  for _, file_data in ipairs(files_with_sizes) do
-    table.insert(final_files, file_data.path)
-  end
-
-  common.log("Total included files after filtering and sorting: " .. #final_files)
-  return final_files
-end
-
 function aiconfig.listScannedFilesAsSentence()
   local analyzed_files_as_array = aiconfig.listScannedFilesFromConfig()
   local num_files = #analyzed_files_as_array
@@ -228,6 +111,7 @@ function aiconfig.listScannedFilesAsSentence()
 
   local file_names = {}
   for _, file in ipairs(analyzed_files_as_array) do
+    -- NOTE: produces a literal "%s"; deferred to functional review.
     table.insert(file_names, string.format("`%%s`", file))
   end
 
@@ -244,17 +128,154 @@ function aiconfig.listScannedFilesAsSentence()
   return analyzed_files_as_string
 end
 
+-- ===== Project root =====
+
+-- Ordered marker finders. Each returns a path (or "") whose parent directory
+-- is the project root. Note that `.ai-scanned-files` is only looked up in the
+-- current working directory, while the others search upward.
+local ROOT_MARKER_FINDERS = {
+  function() return aiconfig.findScannedFilesConfig() end,
+  function() return vim.fn.finddir(".git", ".;") end,
+  function() return vim.fn.findfile(".gitignore", ".;") end,
+  function() return vim.fn.findfile("README.md", ".;") end,
+}
+
+---@return string
+function aiconfig.getProjectRoot()
+  for _, find_marker in ipairs(ROOT_MARKER_FINDERS) do
+    local marker_path = find_marker()
+    if marker_path ~= "" then
+      return vim.fn.fnamemodify(marker_path, ":h")
+    end
+  end
+  return vim.fn.getcwd()
+end
+
+-- ===== Scanned files =====
+
+-- Split config lines into include ('+') and exclude ('-') glob lists.
+-- Lines of one character or less are ignored.
+local function parse_scan_patterns(lines)
+  local include_globs = {}
+  local exclude_globs = {}
+
+  for _, line in ipairs(lines) do
+    local trimmed_line = vim.trim(line)
+    if #trimmed_line > 1 then
+      if vim.startswith(trimmed_line, "+") then
+        local pattern = trimmed_line:sub(2)
+        table.insert(include_globs, pattern)
+        common.log("Include glob pattern: " .. pattern)
+      elseif vim.startswith(trimmed_line, "-") then
+        local pattern = trimmed_line:sub(2)
+        table.insert(exclude_globs, pattern)
+        common.log("Exclude glob pattern: " .. pattern)
+      end
+    end
+  end
+
+  return include_globs, exclude_globs
+end
+
+local function to_lua_patterns(globs)
+  local lua_patterns = {}
+  for _, glob in ipairs(globs) do
+    local lua_pattern = globpattern.globtopattern(glob)
+    table.insert(lua_patterns, lua_pattern)
+    common.log("Converted exclude glob '" .. glob .. "' to Lua pattern: " .. lua_pattern)
+  end
+  return lua_patterns
+end
+
+local function is_excluded(relative_path, exclude_patterns)
+  for _, exclude_pattern in ipairs(exclude_patterns) do
+    if string.match(relative_path, exclude_pattern) then
+      common.log("File '" .. relative_path .. "' excluded by pattern: " .. exclude_pattern)
+      return true
+    end
+  end
+  return false
+end
+
+-- Expand include globs under project_root, drop excluded and duplicate files.
+-- Returns an array of { path, size } (path relative to project_root).
+local function collect_files(project_root, include_globs, exclude_patterns)
+  local files = {}
+  local seen = {}
+
+  for _, include_glob in ipairs(include_globs) do
+    common.log("Processing include glob pattern: " .. include_glob)
+    local matches = vim.fn.glob(project_root .. '/' .. include_glob, false, true)
+
+    for _, full_path in ipairs(matches) do
+      local relative_path = string.sub(full_path, #project_root + 2)
+
+      if seen[relative_path] then
+        common.log("File '" .. relative_path .. "' already processed, skipping duplicate.")
+      elseif not is_excluded(relative_path, exclude_patterns) then
+        local file_info = vim.loop.fs_stat(full_path)
+        if file_info and file_info.type == 'file' then
+          table.insert(files, { path = relative_path, size = file_info.size })
+          seen[relative_path] = true
+          common.log("File '" .. relative_path .. "' included (Size: " .. file_info.size .. ")")
+        else
+          common.log("Path '" .. relative_path .. "' is not a file or stat failed, skipping.")
+        end
+      end
+    end
+  end
+
+  return files
+end
+
+--- List the files selected by `.ai-scanned-files`, largest first.
+---@return string[] relative paths
+function aiconfig.listScannedFilesFromConfig()
+  local config_path = aiconfig.findScannedFilesConfig()
+  if config_path == "" then
+    common.log("No .ai-scanned-files config found.")
+    return {}
+  end
+
+  common.log("Reading scanned files config: " .. config_path)
+  local lines = vim.fn.readfile(config_path)
+  if not lines or #lines == 0 then
+    common.log("Config file is empty or could not be read: " .. config_path)
+    return {}
+  end
+
+  local include_globs, exclude_globs = parse_scan_patterns(lines)
+  local exclude_patterns = to_lua_patterns(exclude_globs)
+  local files = collect_files(aiconfig.getProjectRoot(), include_globs, exclude_patterns)
+
+  table.sort(files, function(a, b)
+    return a.size > b.size
+  end)
+
+  local paths = {}
+  for _, file in ipairs(files) do
+    table.insert(paths, file.path)
+  end
+
+  common.log("Total included files after filtering and sorting: " .. #paths)
+  return paths
+end
+
+---@param file_relative_path string
+---@return string
 function aiconfig.contentOf(file_relative_path)
   local full_path = aiconfig.getProjectRoot() .. '/' .. file_relative_path
   if vim.fn.filereadable(full_path) == 1 then
     local lines = vim.fn.readfile(full_path)
-    if lines then -- readfile returns empty list if file not found/readable, or list of lines
+    if lines then
       return table.concat(lines, "\n")
     end
   end
   common.log("Could not read content of: " .. full_path)
   return ""
 end
+
+-- ===== Formatted table rendering =====
 
 local function format_size(size)
   if size > 1024 * 1024 then
@@ -292,53 +313,76 @@ local function pad_left(str, width)
   return string.rep(" ", width - #str) .. str
 end
 
+-- Render one markdown table line. `aligns[i]` is "left" or "right"; `fill` is
+-- the character placed around cells (" " for content rows, "-" for the separator).
+local function format_row(cells, widths, aligns, fill)
+  local padded = {}
+  for i, cell in ipairs(cells) do
+    if aligns[i] == "right" then
+      padded[i] = pad_left(cell, widths[i])
+    else
+      padded[i] = pad_right(cell, widths[i])
+    end
+  end
+  return "|" .. fill .. table.concat(padded, fill .. "|" .. fill) .. fill .. "|"
+end
+
+local HEADER_CELLS = { "LoC", "Size", "% size", "File name" }
+local ROW_ALIGNS = { "right", "right", "right", "left" }
+local HEADER_ALIGNS = { "left", "left", "left", "left" }
+
+-- rows: array of { lines_str, size_str, percent_str, name }
 local function build_table(title, rows, total_lines, total_size_str)
-  -- rows: array of { lines_str = "...", size_str = "...", percent_str = "...", name = "..." }
-  local header_lines = "LoC"
-  local header_size = "Size"
-  local header_percent = "% size"
-  local header_name = "File name"
-
-  local col_lines_width = #header_lines
-  local col_size_width = #header_size
-  local col_percent_width = #header_percent
-  local col_name_width = #header_name
-
-  for _, row in ipairs(rows) do
-    if #row.lines_str > col_lines_width then col_lines_width = #row.lines_str end
-    if #row.size_str  > col_size_width  then col_size_width  = #row.size_str  end
-    if #row.percent_str > col_percent_width then col_percent_width = #row.percent_str end
-    if #row.name      > col_name_width  then col_name_width  = #row.name      end
+  local widths = {}
+  for i, header in ipairs(HEADER_CELLS) do
+    widths[i] = #header
   end
 
-  -- Also account for the totals row
+  for _, row in ipairs(rows) do
+    widths[1] = math.max(widths[1], #row.lines_str)
+    widths[2] = math.max(widths[2], #row.size_str)
+    widths[3] = math.max(widths[3], #row.percent_str)
+    widths[4] = math.max(widths[4], #row.name)
+  end
+
+  -- NOTE: the totals are never rendered as a row; they only affect column widths.
   local total_lines_str = tostring(total_lines)
   local total_label = "Total (" .. total_size_str .. ")"
-  if #total_lines_str > col_lines_width then col_lines_width = #total_lines_str end
-  if #total_label    > col_name_width  then col_name_width  = #total_label    end
+  widths[1] = math.max(widths[1], #total_lines_str)
+  widths[4] = math.max(widths[4], #total_label)
+
+  local separator_cells = {}
+  for i, width in ipairs(widths) do
+    separator_cells[i] = string.rep("-", width)
+  end
 
   local out = {}
   table.insert(out, "## " .. title .. "\n")
-  table.insert(out, "| " .. pad_right(header_lines, col_lines_width)
-    .. " | " .. pad_right(header_size, col_size_width)
-    .. " | " .. pad_right(header_percent, col_percent_width)
-    .. " | " .. pad_right(header_name, col_name_width) .. " |")
-  table.insert(out, "|-" .. string.rep("-", col_lines_width)
-    .. "-|-" .. string.rep("-", col_size_width)
-    .. "-|-" .. string.rep("-", col_percent_width)
-    .. "-|-" .. string.rep("-", col_name_width) .. "-|")
+  table.insert(out, format_row(HEADER_CELLS, widths, HEADER_ALIGNS, " "))
+  table.insert(out, format_row(separator_cells, widths, HEADER_ALIGNS, "-"))
 
   for _, row in ipairs(rows) do
-    table.insert(out, "| " .. pad_left(row.lines_str, col_lines_width)
-      .. " | " .. pad_left(row.size_str, col_size_width)
-      .. " | " .. pad_left(row.percent_str, col_percent_width)
-      .. " | " .. pad_right(row.name, col_name_width) .. " |")
+    table.insert(out, format_row({ row.lines_str, row.size_str, row.percent_str, row.name }, widths, ROW_ALIGNS, " "))
   end
-
 
   return table.concat(out, "\n")
 end
 
+local function to_table_rows(files_data)
+  local rows = {}
+  for _, data in ipairs(files_data) do
+    table.insert(rows, {
+      lines_str = data.nb_lines_str,
+      size_str = data.size_str,
+      percent_str = data.percent_str,
+      name = data.path,
+    })
+  end
+  return rows
+end
+
+---@param scanned_files_paths string[]|nil defaults to the files from `.ai-scanned-files`
+---@return string markdown
 function aiconfig.listScannedFilesAsFormattedTable(scanned_files_paths)
   local analyzed_files_paths = scanned_files_paths or aiconfig.listScannedFilesFromConfig()
   local project_root = aiconfig.getProjectRoot()
@@ -369,7 +413,6 @@ function aiconfig.listScannedFilesAsFormattedTable(scanned_files_paths)
     common.log("Processed: " .. relative_path .. " (Size: " .. size .. ", Lines: " .. nb_lines .. ")")
   end
 
-  -- Calculate percent sizes
   for _, data in ipairs(files_data) do
     local percent = total_size > 0 and (data.size / total_size * 100) or 0
     data.percent_str = string.format("%.2f%%", percent)
@@ -378,33 +421,12 @@ function aiconfig.listScannedFilesAsFormattedTable(scanned_files_paths)
   local total_size_str = format_size(total_size)
   local num_files = #files_data
 
-  -- Build sorted-by-size (desc) list - files_data is already sorted by size desc
-  local rows_by_size = {}
-  for _, data in ipairs(files_data) do
-    table.insert(rows_by_size, {
-      lines_str = data.nb_lines_str,
-      size_str = data.size_str,
-      percent_str = data.percent_str,
-      name = data.path,
-    })
-  end
+  -- files_data keeps the input order, which is already sorted by size (descending).
+  local rows_by_size = to_table_rows(files_data)
 
-  -- Build sorted-by-name (asc) list
-  local sorted_by_name = {}
-  for _, data in ipairs(files_data) do
-    table.insert(sorted_by_name, data)
-  end
+  local sorted_by_name = vim.list_extend({}, files_data)
   table.sort(sorted_by_name, function(a, b) return a.path < b.path end)
-
-  local rows_by_name = {}
-  for _, data in ipairs(sorted_by_name) do
-    table.insert(rows_by_name, {
-      lines_str = data.nb_lines_str,
-      size_str = data.size_str,
-      percent_str = data.percent_str,
-      name = data.path,
-    })
-  end
+  local rows_by_name = to_table_rows(sorted_by_name)
 
   local result_lines = {}
   table.insert(result_lines,
@@ -422,4 +444,3 @@ function aiconfig.listScannedFilesAsFormattedTable(scanned_files_paths)
 end
 
 return aiconfig
-

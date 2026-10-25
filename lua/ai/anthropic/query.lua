@@ -3,31 +3,32 @@ local provider = require('ai.provider')
 
 local query = {}
 
--- Normalize a model name that may carry a provider-specific effort level suffix.
--- The project treats effort levels uniformly: split on the `:` separator,
--- keep the base model id, and map the suffix to the provider's valid API field
--- when it is recognized. For Anthropic, valid effort values are `low`, `medium`,
--- `high`, `xhigh`, and `max`; `none` maps to the `between_tools` thinking mode.
--- Models without a `:` separator or with an unrecognized suffix are passed
--- through unchanged so model existence can be validated by the upstream API.
-local function normalizeAnthropicModel(model)
-  local base_model, suffix = model:match('^(.+):(.+)$')
+-- Valid `effort` values for Anthropic's `output_config`.
+local EFFORT_LEVELS = { low = true, medium = true, high = true, xhigh = true, max = true }
 
-  if not base_model or not suffix then
+-- Split an optional effort suffix off the model id (see common.splitModelSuffix).
+-- Recognized suffixes map to Anthropic API fields: effort levels go to
+-- `output_config.effort`, and `none` maps to the `between_tools` thinking mode.
+-- Unrecognized suffixes are passed through so the upstream API can validate them.
+local function normalize_model(model)
+  local base_model, suffix = common.splitModelSuffix(model)
+
+  if suffix == nil then
     return { model = model }
   end
 
-  if suffix == 'low'
-      or suffix == 'medium'
-      or suffix == 'high'
-      or suffix == 'xhigh'
-      or suffix == 'max' then
+  if EFFORT_LEVELS[suffix] then
     return { model = base_model, effort = suffix }
   elseif suffix == 'none' then
     return { model = base_model, thinking = { type = 'between_tools' } }
   end
 
   return { model = model }
+end
+
+-- Sonnet models are opted in to the 1M-token context window.
+local function supports_1m_context(model)
+  return model ~= nil and model:match('^claude%-sonnet') ~= nil
 end
 
 local anthropic_runner = provider.createQueryRunner({
@@ -46,17 +47,16 @@ local anthropic_runner = provider.createQueryRunner({
       ['x-api-key'] = api_key,
       ['anthropic-version'] = '2023-06-01'
     }
-    if model and model:match('^claude%-sonnet') then
+    if supports_1m_context(model) then
       headers['anthropic-beta'] = 'context-1m-2025-08-07'
     end
     return headers
   end,
   -- `messages` is an ordered array of { role = "user"|"assistant", content = "..." }
-  -- built by ai.conversation.build(). Anthropic's Messages API already accepts this
-  -- exact shape (plain string content per turn), so we pass it through as-is,
-  -- matching wire-for-wire what anthropic-agent's buildRequestBody() sends today.
+  -- built by ai.conversation.build(). Anthropic's Messages API accepts this exact
+  -- shape, so it is passed through as-is (same wire format as anthropic-agent).
   build_request_body = function(model, instruction, messages)
-    local normalized = normalizeAnthropicModel(model)
+    local normalized = normalize_model(model)
 
     local request_body = {
       model = normalized.model,
@@ -81,14 +81,8 @@ local anthropic_runner = provider.createQueryRunner({
     local usage = data.usage or {}
     return usage.input_tokens or 0, usage.output_tokens or 0
   end,
-  -- Anthropic's Messages API returns `content` as an array of blocks, and the
-  -- first block is not guaranteed to be a `text` block (e.g. a `thinking` block
-  -- can precede it). Mirror anthropic-agent's transformSuccessResponse() exactly:
-  -- filter every block of type `text` with a string `text` field, and join them
-  -- with `\n\n`. Previously this only read `data.content[1].text`, which silently
-  -- returned an empty string whenever the first block wasn't a `text` block,
-  -- causing the response body to be dropped from both the popup and the history
-  -- file even though the API call itself succeeded.
+  -- Mirrors anthropic-agent: keep every `text` block (other block types, such as
+  -- `thinking`, may come first) and join them with a blank line.
   extract_content = function(data)
     if type(data.content) ~= 'table' then
       return ""
@@ -122,13 +116,7 @@ local anthropic_runner = provider.createQueryRunner({
   end
 })
 
-function query.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-  anthropic_runner.askHeavy(model, instruction, prompt, opts, api_key, agent_host, upload_url, upload_token, upload_as_public, scanned_files)
-end
-
-function query.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-  anthropic_runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
-end
-
+query.askHeavy = anthropic_runner.askHeavy
+query.askLight = anthropic_runner.askLight
 
 return query
