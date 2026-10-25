@@ -10,16 +10,11 @@ local M = {}
 -- bare-prompt light request; give them a generous timeout (in milliseconds).
 local LIGHT_REQUEST_TIMEOUT_MS = 120000
 
--- Shared helper: build the project_context array ({ filename, content }) from a
--- list of scanned file relative paths. Used by both askHeavy and askLight so
--- both code paths get identical, safe handling of empty/unreadable files.
+-- Build the project_context array ({ filename, content }) from a list of
+-- scanned file relative paths for askHeavy.
 -- Files whose content is nil or empty string are skipped (with a logged
--- warning) instead of being propagated further, since:
---   - Server-side (askHeavy path), the agent's handleFile rejects empty
---     content with a hard 400, which previously killed the entire heavy
---     request sequence because of a single bad file.
---   - Client-side (askLight path), an empty file entry would otherwise be
---     embedded as a confusing empty file content block in the conversation.
+-- warning) instead of being propagated further, since server-side (askHeavy
+-- path), the agent's handleFile rejects empty content with a hard 400.
 local function build_project_context(scanned_files_list)
   local project_context = {}
   local files_list = scanned_files_list or {}
@@ -168,9 +163,7 @@ function M.createQueryRunner(config)
       reportAgentConfigError(
         opts,
         string.format(
-          "%s agent mode was selected but no agent host is configured. " ..
-          "Set the corresponding `_agent_host` option, force `query_mode = \"standalone\"` for this command, " ..
-          "or reduce the scanned files size below the configured threshold.",
+          "%s agent host is not configured. Set the corresponding `_agent_host` option in your plugin configuration.",
           config.name
         )
       )
@@ -209,7 +202,7 @@ function M.createQueryRunner(config)
     )
   end
 
-  function runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public, scanned_files)
+  function runner.askLight(model, instruction, prompt, opts, api_key, upload_url, upload_token, upload_as_public)
     if model == "disabled" then
       common.handleDisabledModel(config.name, model,
         {
@@ -228,13 +221,9 @@ function M.createQueryRunner(config)
       return
     end
 
-    -- Build project_context (possibly empty) so every light call goes through
-    -- the exact same conversation-shaping code path, regardless of whether
-    -- project files are being embedded or not.
-    local project_context = build_project_context(scanned_files)
-    local messages = conversation.build(prompt, project_context)
+    local messages = conversation.build(prompt, nil)
 
-    local input_size, input_lines = common.calculateInputStats(instruction, prompt, project_context)
+    local input_size, input_lines = common.calculateInputStats(instruction, prompt, nil)
     opts.stats = {
       model = model,
       input_size = input_size,
@@ -255,25 +244,37 @@ function M.createQueryRunner(config)
       url = config.api_host .. config.api_path
     end
 
-    curl.post(url, {
-      headers = headers,
-      body = vim.fn.json_encode(request_body),
-      timeout = LIGHT_REQUEST_TIMEOUT_MS,
-      callback = function(res)
-        common.log("Before " .. config.name .. " callback call")
+    local success, err = pcall(function()
+      curl.post(url, {
+        headers = headers,
+        body = vim.fn.json_encode(request_body),
+        timeout = LIGHT_REQUEST_TIMEOUT_MS,
+        callback = function(res)
+          common.log("Before " .. config.name .. " callback call")
+          vim.schedule(function()
+            runner.askCallback(res, {
+              handleResult = opts.handleResult,
+              callback = opts.callback,
+              upload_url = upload_url,
+              upload_token = upload_token,
+              upload_as_public = upload_as_public,
+              stats = opts.stats,
+              raw_output = opts.raw_output,
+            }, model, prompt)
+          end)
+        end
+      })
+    end)
+
+    if not success then
+      local error_msg = string.format("Error: Exception while sending direct API request to %s: %s", config.name, tostring(err))
+      common.log(config.name .. " askLight exception: " .. error_msg)
+      if opts.callback ~= nil then
         vim.schedule(function()
-          runner.askCallback(res, {
-            handleResult = opts.handleResult,
-            callback = opts.callback,
-            upload_url = upload_url,
-            upload_token = upload_token,
-            upload_as_public = upload_as_public,
-            stats = opts.stats,
-            raw_output = opts.raw_output,
-          }, model, prompt)
+          opts.callback(error_msg, true)
         end)
       end
-    })
+    end
   end
 
   return runner

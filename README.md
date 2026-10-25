@@ -6,7 +6,7 @@ Thank you Gerald for your work.
 
 # code-ai.nvim
 
-A Neovim plugin that sends prompts to Anthropic, GoogleAI, and OpenAI, can optionally route large requests through external agents, and includes an Ollama-powered prompt rewording command.
+A Neovim plugin that orchestrates multi-stage AI coding pipelines (`plan`, `reword`, `implement`) across Anthropic, GoogleAI, and OpenAI using external multi-turn conversation agents, and includes an Ollama-powered prompt rewording command.
 
 Here is a demo without using the agents:
 
@@ -19,10 +19,10 @@ Here is a demo using the agents:
 ## Features
 
 - Anthropic, GoogleAI, and OpenAI support
-- Two execution modes:
-  - **standalone**: direct API calls from Neovim
-  - **agent**: requests sent to external agent servers
-- Automatic routing between standalone and agent mode based on scanned file size
+- Three-stage pipeline architecture (`plan`, `reword`, `implement`):
+  - **`plan` & `implement` stages**: always execute through external agent servers using sequential multi-turn conversations stored in SQLite, bypassing `plenary.nvim`'s ~120KB payload size limit
+  - **`reword` stage**: uses a lightweight direct API request (prompt-only, no code context) to refine the plan output
+- Prefix-aligned prompt caching: static system instructions and project files are sent in identical order across `plan` and `implement`, while stage-specific rules (`PLAN_RULES` / `IMPLEMENT_RULES`) are appended to the final `prompt` turn
 - Project-context scanning from `.ai-scanned-files`
 - Custom prompt commands
 - Built-in popup results
@@ -35,50 +35,35 @@ Here is a demo using the agents:
 For every configured prompt command, the plugin:
 
 1. collects the selected text or command argument
-2. loads system instructions from `.ai-system-instructions.md` when present
+2. loads static system instructions from `.ai-system-instructions.md` when present (or uses a default fallback)
 3. reads project files listed by `.ai-scanned-files`
-4. decides whether to run in standalone or agent mode
-5. resolves the model pipeline (`plan`, `reword`, `implement`):
-   - **`plan` (optional)**: generates a preliminary high-level plan based on the request and `.ai-scanned-files` (never returns full file contents).
-   - **`reword` (optional)**: refines the plan output into an implementation prompt enforcing full file contents (never diffs or snippets).
+4. resolves and validates the model pipeline (`plan`, `reword`, `implement`), including required `*_api_key` and `*_agent_host` settings:
+   - **`plan` (optional, via Agent)**: sends the API key, static system instructions, model, each scanned project file one by one, and the user prompt + `PLAN_RULES` to the external agent to generate a preliminary high-level plan (never returns full file contents).
+   - **`reword` (optional, Direct API)**: sends a direct API request with the original request and plan output (without scanned files) to refine the plan into an implementation prompt enforcing full file contents.
    - If either `plan` or `reword` is unset/nil, the planning stage is skipped.
-   - **`implement` (mandatory)**: produces the complete modified or newly created file contents.
-6. executes the pipeline sequentially and shows live status (`[1/3] Planning`, `[2/3] Rewording plan`, `[3/3] Implementing`) in a floating popup
-7. renders the final result in the floating popup
+   - **`implement` (mandatory, via Agent)**: sends the API key, static system instructions, model, each scanned project file one by one, and the merged prompt + `IMPLEMENT_RULES` to the external agent to produce the complete modified or newly created file contents.
+5. executes the pipeline sequentially and shows live status (`[1/3] Planning`, `[2/3] Rewording plan`, `[3/3] Implementing`) in a floating popup
+6. renders the final result in the floating popup
 
-### Standalone mode
+### Sequential multi-turn agent execution (`plan` & `implement`)
 
-Standalone mode sends requests directly to the provider APIs from Neovim.
+Because `plenary.nvim` has a payload size limit of approximately 120KB per HTTP request, sending the entire prompt and project context in a single call is not sustainable for larger codebases. Instead, `plan` and `implement` always communicate with an external `code-ai-agent` service:
 
-- It can still include scanned project files
-- It builds a multi-turn conversation locally before calling the provider API
-- It does not require `*_agent_host` options
+1. `api key` — resets the agent's SQLite database and stores the key
+2. `system instructions` — stores static user instructions from `.ai-system-instructions.md`
+3. `model` — stores the target model identifier
+4. `file` (repeated sequentially for each scanned file) — stores each file turn in SQLite
+5. `prompt` — stores the final prompt (with `PLAN_RULES` or `IMPLEMENT_RULES` appended), triggers the agent to reassemble the complete multi-turn conversation from SQLite, and forwards it to the upstream AI provider API
 
-### Agent mode
+If any individual file exceeds `plenary.nvim`'s ~120KB limit, the `plenary.nvim` error is caught and displayed directly in the popup.
 
-Agent mode sends the request to your external agents.
+### Prompt caching optimization
 
-- It uploads the API key, system instructions, selected project files, and prompt as separate chunks
-- The final prompt triggers the model call on the agent side
-- It requires the corresponding `*_agent_host` option
+Both `plan` and `implement` send the exact same static `system instructions` chunk followed by the exact same sequence of `file` chunks (`file 1`, `file 2`, ..., `file N`). Stage-specific instructions (`PLAN_RULES` and `IMPLEMENT_RULES`) are appended only to the final `prompt` chunk at the very end of the conversation. This guarantees that the conversation prefix is byte-for-byte identical between `plan` and `implement`, maximizing provider-side prompt cache hits.
 
-### How mode selection works
+### Direct API execution (`reword`)
 
-Each prompt runs in one of these ways:
-
-- `query_mode = 'standalone'`: always use standalone mode
-- `query_mode = 'agent'`: always use agent mode
-- no `query_mode`: automatic selection
-
-Automatic selection uses `.ai-scanned-files`:
-
-- if no files are matched, standalone mode is used
-- if matched files total less than `agent_size_threshold_bytes`, standalone mode is used
-- if matched files total is greater than or equal to `agent_size_threshold_bytes`, agent mode is used
-
-Default `agent_size_threshold_bytes` is `102400`.
-
-If agent mode is selected but the matching `*_agent_host` option is empty, the command fails with an agent configuration error.
+The `reword` stage only refines the textual plan output and never includes scanned project files. Because its payload is small (well under 120KB), it sends a direct API request from Neovim using only `<provider>_api_key` (no `<provider>_agent_host` required for the `reword` provider).
 
 ## The agent
 
@@ -171,7 +156,6 @@ Example with `lazy.nvim`:
         ollama_host = 'http://127.0.0.1:11434',
         ollama_model = 'llama3.2',
 
-        agent_size_threshold_bytes = 102400,
         locale = 'en',
         alternate_locale = 'fr',
         result_popup_gets_focus = false,
@@ -198,7 +182,6 @@ Example with `lazy.nvim`:
             refactor = {
                 command = 'AIRefactor',
                 prompt_tpl = [[Refactor this code: ${input}]],
-                query_mode = 'standalone',
                 require_input = true,
                 models = {
                     { plan      = 'anthropic/claude-sonnet-5:high' },
@@ -249,11 +232,11 @@ models = {
 }
 ```
 
-A prompt without a valid `implement` model or without an API key configured for its referenced provider will abort with an explanatory error popup.
+A prompt without a valid `implement` model, without an API key configured for its referenced providers, or without an agent host configured for its `plan` and `implement` providers will abort with an explanatory error popup.
 
 ### Agent configuration
 
-Set `anthropic_agent_host`, `googleai_agent_host`, and/or `openai_agent_host` only if you want agent mode to be available for that provider.
+Set `anthropic_agent_host`, `googleai_agent_host`, and/or `openai_agent_host` for any provider used in the `plan` or `implement` stages. (`reword` uses direct API requests and only requires the corresponding `*_api_key`.)
 
 ### Ollama configuration
 
@@ -287,7 +270,7 @@ Matched files are deduplicated, sorted by size, and unreadable or empty files ar
 
 ### `.ai-system-instructions.md`
 
-`.ai-system-instructions.md` is optional and is read from the current working directory if present. The plugin automatically appends stage-specific guidance for planning, rewording, and implementation steps to ensure each model strictly adheres to output formatting requirements (e.g. planning never provides full files; implementation always provides complete files).
+`.ai-system-instructions.md` is optional and is read from the current working directory if present (falling back to a default system instruction when absent or empty). Static user system instructions are sent as the `system instructions` chunk for both `plan` and `implement`, while stage-specific rules (`PLAN_RULES` and `IMPLEMENT_RULES`) are appended to the final `prompt` chunk so that the conversation prefix (`system instructions` + scanned files) remains identical and cacheable across `plan` and `implement`.
 
 ## Commands
 
@@ -335,7 +318,6 @@ The popup closes automatically when the cursor moves.
 | `anthropic_api_key` | string | `''` | Anthropic API key. |
 | `googleai_api_key` | string | `''` | GoogleAI API key. |
 | `openai_api_key` | string | `''` | OpenAI API key. |
-| `agent_size_threshold_bytes` | number | `102400` | Default threshold used by automatic routing. |
 | `ollama_host` | string | `''` | Ollama host used by `:AIRewordPrompt`. |
 | `ollama_model` | string | `''` | Ollama model used by `:AIRewordPrompt`. |
 | `locale` | string | `'en'` | Template placeholder value available as `${locale}`. |
@@ -359,8 +341,6 @@ These fields are supported inside each entry of `opts.prompts`:
 | `result_tpl` | No | Template used to render the final combined output. Defaults to `${output}`. |
 | `require_input` | No | Require an argument or visual selection before running. |
 | `models` | No | Model pipeline definition for this prompt (`plan`, `implement`, `reword`), overriding global `models`. |
-| `query_mode` | No | Force `'standalone'` or `'agent'` for this prompt. |
-| `agent_size_threshold_bytes` | No | Override the global size threshold for this prompt. |
 
 Per-prompt API keys and per-prompt agent hosts are not supported by the current codebase; only the global options are used for those values.
 

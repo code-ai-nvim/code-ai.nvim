@@ -27,8 +27,6 @@ M.opts = {
   googleai_api_key = '',
   openai_api_key = '',
 
-  agent_size_threshold_bytes = 102400,
-
   ollama_host = '',
   ollama_model = '',
 
@@ -195,8 +193,7 @@ local function queryProviderRunner(parsed_model, instruction, prompt_text, query
       api_key,
       upload_url,
       upload_token,
-      upload_as_public,
-      scanned_files
+      upload_as_public
     )
   end
 end
@@ -253,6 +250,18 @@ function M.handle(name, input)
     return
   end
 
+  local implement_agent_host = M.opts[implement_parsed.provider .. '_agent_host']
+  if not implement_agent_host or implement_agent_host == '' then
+    local err_msg = string.format(
+      "# Configuration Error\n\nMissing agent host for '%s' provider (`%s_agent_host`) required by 'implement' model '%s'.",
+      implement_parsed.provider, implement_parsed.provider, implement_spec
+    )
+    common.log(err_msg)
+    local update = M.createPopup(err_msg, width - 8, height - 4)
+    update(err_msg)
+    return
+  end
+
   -- Validate optional 'plan' and 'reword' models
   -- Both must be present to enable planning; if either is absent/nil/disabled, planning is skipped.
   local has_planning = false
@@ -290,6 +299,18 @@ function M.handle(name, input)
       return
     end
 
+    local p_agent_host = M.opts[p_parsed.provider .. '_agent_host']
+    if not p_agent_host or p_agent_host == '' then
+      local err_msg = string.format(
+        "# Configuration Error\n\nMissing agent host for '%s' provider (`%s_agent_host`) required by 'plan' model '%s'.",
+        p_parsed.provider, p_parsed.provider, plan_spec
+      )
+      common.log(err_msg)
+      local update = M.createPopup(err_msg, width - 8, height - 4)
+      update(err_msg)
+      return
+    end
+
     local r_api_key = M.opts[r_parsed.provider .. '_api_key']
     if not r_api_key or r_api_key == '' then
       local err_msg = string.format(
@@ -307,35 +328,7 @@ function M.handle(name, input)
     has_planning = true
   end
 
-  -- Determine query mode (agent vs standalone)
-  local query_mode = def.query_mode
-  local is_heavy = false
-  local scanned_files_list = nil
-
-  if query_mode == "standalone" then
-    is_heavy = false
-    scanned_files_list = aiconfig.listScannedFilesFromConfig()
-    common.log("Using standalone mode (forced by command configuration)")
-  elseif query_mode == "agent" then
-    is_heavy = true
-    scanned_files_list = aiconfig.listScannedFilesFromConfig()
-    common.log("Using agent mode (forced by command configuration)")
-  else
-    scanned_files_list = aiconfig.listScannedFilesFromConfig()
-    local total_size = aiconfig.getScannedFilesTotalSize(scanned_files_list)
-    local threshold = def.agent_size_threshold_bytes or M.opts.agent_size_threshold_bytes or 102400
-
-    if #scanned_files_list == 0 then
-      is_heavy = false
-      common.log("Using standalone mode (no files to scan)")
-    elseif total_size >= threshold then
-      is_heavy = true
-      common.log(string.format("Using agent mode (scanned files total size %d bytes >= threshold %d bytes)", total_size, threshold))
-    else
-      is_heavy = false
-      common.log(string.format("Using standalone mode (scanned files total size %d bytes < threshold %d bytes)", total_size, threshold))
-    end
-  end
+  local scanned_files_list = aiconfig.listScannedFilesFromConfig()
 
   local show_files_table = (scanned_files_list ~= nil and #scanned_files_list > 0)
   local scanned_files_table = show_files_table and aiconfig.listScannedFilesAsFormattedTable(scanned_files_list) or ""
@@ -403,13 +396,15 @@ function M.handle(name, input)
       upload_as_public = common_query_opts.upload_as_public,
     }
 
+    local implement_prompt_with_rules = aiconfig.buildImplementPrompt(final_implement_prompt)
+
     queryProviderRunner(
       implement_parsed,
-      aiconfig.getImplementInstructions(),
-      final_implement_prompt,
+      aiconfig.getSystemInstructions(),
+      implement_prompt_with_rules,
       query_opts,
       scanned_files_list,
-      is_heavy,
+      true,
       common_query_opts
     )
   end
@@ -487,13 +482,15 @@ function M.handle(name, input)
       upload_as_public = common_query_opts.upload_as_public,
     }
 
+    local plan_prompt_with_rules = aiconfig.buildPlanPrompt(original_prompt)
+
     queryProviderRunner(
       plan_parsed,
-      aiconfig.getPlanInstructions(),
-      original_prompt,
+      aiconfig.getSystemInstructions(),
+      plan_prompt_with_rules,
       query_opts,
       scanned_files_list,
-      is_heavy,
+      true,
       common_query_opts
     )
   end
@@ -547,15 +544,19 @@ function M.setup(opts)
     end
   end
 
-  -- Check provider API keys for any models configured globally or per-prompt
+  -- Check provider API keys and agent hosts for any models configured globally or per-prompt
   local referenced_providers = {}
+  local agent_providers = {}
   local function collectProviders(models_def)
     if type(models_def) ~= 'table' then return end
     local task_models = common.resolveTaskModels(models_def, nil)
-    for _, spec in pairs(task_models) do
+    for task, spec in pairs(task_models) do
       local parsed = common.parseModelSpec(spec)
       if parsed then
         referenced_providers[parsed.provider] = true
+        if task == 'plan' or task == 'implement' then
+          agent_providers[parsed.provider] = true
+        end
       end
     end
   end
@@ -569,6 +570,13 @@ function M.setup(opts)
     local api_key = M.opts[provider .. '_api_key']
     if api_key == nil or api_key == '' then
       common.log(provider .. " API key is not configured; calls using this provider will fail.")
+    end
+  end
+
+  for provider, _ in pairs(agent_providers) do
+    local agent_host = M.opts[provider .. '_agent_host']
+    if agent_host == nil or agent_host == '' then
+      common.log("Warning: " .. provider .. " agent host (" .. provider .. "_agent_host) is not configured; plan/implement calls using this provider will fail.")
     end
   end
 

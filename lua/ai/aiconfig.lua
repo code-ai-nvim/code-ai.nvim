@@ -11,6 +11,8 @@ function aiconfig.findSystemInstructionsFile()
   end
 end
 
+local DEFAULT_SYSTEM_INSTRUCTIONS = "You are an expert software engineer and coding assistant."
+
 function aiconfig.getSystemInstructions()
   local user_instructions_path = aiconfig.findSystemInstructionsFile()
   local content = ""
@@ -21,6 +23,9 @@ function aiconfig.getSystemInstructions()
     else
       common.log("Could not read user system instructions or file is empty: " .. user_instructions_path)
     end
+  end
+  if vim.trim(content) == "" then
+    return DEFAULT_SYSTEM_INSTRUCTIONS
   end
   return content
 end
@@ -47,11 +52,7 @@ local IMPLEMENT_RULES = [[
 ]]
 
 function aiconfig.getPlanInstructions()
-  local user_instructions = aiconfig.getSystemInstructions()
-  if user_instructions and user_instructions ~= "" then
-    return user_instructions .. "\n\n" .. PLAN_RULES
-  end
-  return PLAN_RULES
+  return aiconfig.getSystemInstructions()
 end
 
 function aiconfig.getRewordInstructions()
@@ -59,11 +60,23 @@ function aiconfig.getRewordInstructions()
 end
 
 function aiconfig.getImplementInstructions()
-  local user_instructions = aiconfig.getSystemInstructions()
-  if user_instructions and user_instructions ~= "" then
-    return user_instructions .. "\n\n" .. IMPLEMENT_RULES
-  end
+  return aiconfig.getSystemInstructions()
+end
+
+function aiconfig.getPlanRules()
+  return PLAN_RULES
+end
+
+function aiconfig.getImplementRules()
   return IMPLEMENT_RULES
+end
+
+function aiconfig.buildPlanPrompt(prompt)
+  return (prompt or "") .. "\n\n" .. PLAN_RULES
+end
+
+function aiconfig.buildImplementPrompt(prompt)
+  return (prompt or "") .. "\n\n" .. IMPLEMENT_RULES
 end
 
 function aiconfig.findScannedFilesConfig()
@@ -241,41 +254,6 @@ function aiconfig.contentOf(file_relative_path)
   end
   common.log("Could not read content of: " .. full_path)
   return ""
-end
-
--- Private helper: stat a file relative to the project root and return its size in bytes.
--- Returns 0 if the file cannot be stat'd (missing, unreadable, or not a regular file).
-local function stat_size(project_root, relative_path)
-  local full_path = project_root .. '/' .. relative_path
-  local file_info = vim.loop.fs_stat(full_path)
-  if file_info and file_info.type == 'file' then
-    return file_info.size
-  end
-  return 0
-end
-
--- Compute the total size in bytes of a list of scanned file relative paths.
--- If scanned_files_paths is not provided, it falls back to
--- aiconfig.listScannedFilesFromConfig() so it can be used standalone.
--- This is purely additive and does not change any existing behavior; it is
--- intended to be the foundation for size-based routing decisions.
-function aiconfig.getScannedFilesTotalSize(scanned_files_paths)
-  local files_paths = scanned_files_paths or aiconfig.listScannedFilesFromConfig()
-
-  if #files_paths == 0 then
-    common.log("getScannedFilesTotalSize: No scanned files, total size is 0.")
-    return 0
-  end
-
-  local project_root = aiconfig.getProjectRoot()
-  local total_size = 0
-
-  for _, relative_path in ipairs(files_paths) do
-    total_size = total_size + stat_size(project_root, relative_path)
-  end
-
-  common.log("getScannedFilesTotalSize: Total size of " .. #files_paths .. " file(s) is " .. total_size .. " bytes.")
-  return total_size
 end
 
 local function format_size(size)
