@@ -59,9 +59,79 @@ function common.uploadContent(url, token, content, model_name, is_public)
   end
 end
 
+-- Parse a model spec in '<provider>/<model>' format (e.g. 'anthropic/claude-sonnet-5:high')
+function common.parseModelSpec(spec)
+  if type(spec) ~= 'string' or spec == '' then
+    return nil, "Model specification must be a non-empty string"
+  end
+
+  local provider, model = spec:match('^([^/]+)/(.+)$')
+  if not provider or not model or model == '' then
+    return nil, string.format("Invalid model format '%s'. Expected '<provider>/<model>' (e.g. 'anthropic/claude-sonnet-5:high')", spec)
+  end
+
+  provider = provider:lower()
+  if provider ~= 'anthropic' and provider ~= 'googleai' and provider ~= 'openai' then
+    return nil, string.format("Unsupported provider '%s' in model '%s'. Valid providers are 'anthropic', 'googleai', 'openai'.", provider, spec)
+  end
+
+  return {
+    provider = provider,
+    model = model,
+    full = spec,
+  }
+end
+
+-- Resolve models for plan, implement, and reword tasks from prompt-level and global definitions.
+-- Supports both array-of-tables ({ { plan = ... }, { implement = ... }, { reword = ... } })
+-- and flat table ({ plan = ..., implement = ..., reword = ... }).
+function common.resolveTaskModels(prompt_models, global_models)
+  local function extract(m)
+    local res = {}
+    if type(m) == 'table' then
+      if m.plan ~= nil then res.plan = m.plan end
+      if m.implement ~= nil then res.implement = m.implement end
+      if m.reword ~= nil then res.reword = m.reword end
+      for _, entry in ipairs(m) do
+        if type(entry) == 'table' then
+          for k, v in pairs(entry) do
+            if (k == 'plan' or k == 'implement' or k == 'reword') and v ~= nil then
+              res[k] = v
+            end
+          end
+        end
+      end
+    end
+    return res
+  end
+
+  local global_extracted = extract(global_models)
+  local prompt_extracted = extract(prompt_models)
+
+  local final_models = {}
+  for _, task in ipairs({ 'plan', 'implement', 'reword' }) do
+    local val = prompt_extracted[task]
+    if val == nil then
+      val = global_extracted[task]
+    end
+    final_models[task] = val
+  end
+
+  -- Empty strings or 'disabled' are treated as nil (task skipped)
+  for k, v in pairs(final_models) do
+    if type(v) == 'string' and (v == '' or v == 'disabled') then
+      final_models[k] = nil
+    end
+  end
+
+  return final_models
+end
+
 function common.askCallback(res, opts, formatResult)
   local result
+  local is_error = false
   if res.status ~= 200 then
+    is_error = true
     if opts.handleError ~= nil then
       result = opts.handleError(res.status, res.body or "No response body")
     else
@@ -72,10 +142,17 @@ function common.askCallback(res, opts, formatResult)
   else
     local success, data = pcall(vim.fn.json_decode, res.body)
     if not success then
+      is_error = true
       common.log("Error: Failed to decode JSON response: " .. (res.body or "No response body"))
       result = "Error: Failed to decode JSON response from agent."
     else
-      result = formatResult(data, opts.upload_url, opts.upload_token, opts.upload_as_public, opts)
+      local formatted, err_flag = formatResult(data, opts.upload_url, opts.upload_token, opts.upload_as_public, opts)
+      result = formatted
+      if err_flag ~= nil then
+        is_error = err_flag
+      elseif type(result) == 'string' and (result:match('^%s*#.*[Ee]rror') or result:match('^Error:')) then
+        is_error = true
+      end
     end
   end
 
@@ -84,7 +161,7 @@ function common.askCallback(res, opts, formatResult)
   end
   
   if opts.callback ~= nil then
-    opts.callback(result)
+    opts.callback(result, is_error)
   end
 end
 
@@ -131,7 +208,8 @@ function common.handleDisabledModel(provider_name, model_name, opts, askCallback
         callback = opts.callback,
         upload_url = opts.upload_url or '',
         upload_token = opts.upload_token or '',
-        upload_as_public = opts.upload_as_public or false
+        upload_as_public = opts.upload_as_public or false,
+        raw_output = opts.raw_output,
       }
     )
   end)
@@ -321,7 +399,7 @@ function common.askHeavy(agent_host, api_key, model, instruction, prompt, projec
 
             common.log("askHeavy: ERROR - " .. error_msg)
             vim.schedule(function()
-              opts.callback("# Agent Error\n\n" .. error_msg)
+              opts.callback("# Agent Error\n\n" .. error_msg, true)
             end)
             return
           end
@@ -337,6 +415,7 @@ function common.askHeavy(agent_host, api_key, model, instruction, prompt, projec
                 upload_token = opts.upload_token,
                 upload_as_public = opts.upload_as_public,
                 stats = opts.stats,
+                raw_output = opts.raw_output,
               })
             end)
           else
@@ -356,7 +435,7 @@ function common.askHeavy(agent_host, api_key, model, instruction, prompt, projec
         current_index, total_chunks, chunk_identifier, tostring(err))
       common.log("askHeavy: EXCEPTION - " .. error_msg)
       vim.schedule(function()
-        opts.callback("# Agent Error\n\n" .. error_msg)
+        opts.callback("# Agent Error\n\n" .. error_msg, true)
       end)
     end
   end

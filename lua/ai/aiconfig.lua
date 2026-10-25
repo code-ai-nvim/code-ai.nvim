@@ -11,13 +11,7 @@ function aiconfig.findSystemInstructionsFile()
   end
 end
 
--- Modified: Added append_embeded parameter to control system instructions appending
-function aiconfig.getSystemInstructions(append_embeded)
-  -- Default to true if not specified (preserve backward compatibility)
-  if append_embeded == nil then
-    append_embeded = true
-  end
-
+function aiconfig.getSystemInstructions()
   local user_instructions_path = aiconfig.findSystemInstructionsFile()
   local content = ""
   if user_instructions_path ~= "" then
@@ -28,69 +22,48 @@ function aiconfig.getSystemInstructions(append_embeded)
       common.log("Could not read user system instructions or file is empty: " .. user_instructions_path)
     end
   end
-
-  -- Only append embeded system instructions if append_embeded is true
-  if not append_embeded then
-    common.log("Skipping embeded system instructions due to configuration")
-    return content
-  end
-
-  -- Find the common-system-instructions.md file in the plugin's runtime path
-  local common_instructions_paths = vim.api.nvim_get_runtime_file("lua/ai/common-system-instructions_en.md", false)
-  local common_content_found = false
-
-  if #common_instructions_paths > 0 then
-    local common_instructions_path = common_instructions_paths[1]
-    common.log("Found common system instructions at: " .. common_instructions_path)
-    if vim.fn.filereadable(common_instructions_path) == 1 then
-      local common_lines = vim.fn.readfile(common_instructions_path)
-      if common_lines and #common_lines > 0 then
-        local common_content_str = table.concat(common_lines, "\n")
-        if content ~= "" then
-          content = content .. "\n\n" .. common_content_str
-        else
-          content = common_content_str
-        end
-        common_content_found = true
-      else
-        common.log("Could not read common system instructions or file is empty: " .. common_instructions_path)
-      end
-    else
-      common.log("Common system instructions file not readable: " .. common_instructions_path)
-    end
-  else
-    common.log("Common system instructions file not found in runtime paths via nvim_get_runtime_file.")
-  end
-
-  if not common_content_found then
-    common.log("Common system instructions not found via runtime path, trying fallback.")
-    -- As a fallback, try to find it relative to this file's location
-    local current_file_info = debug.getinfo(1, "S")
-    if current_file_info and current_file_info.source and current_file_info.source:sub(1,1) == "@" then
-        local current_file_path = current_file_info.source:sub(2)
-        local plugin_dir = vim.fn.fnamemodify(current_file_path, ":h:h") -- Assuming lua/ai/aiconfig.lua, so :h:h gives plugin root
-        local fallback_path = plugin_dir .. "/lua/ai/common-system-instructions_en.md" -- Path relative to plugin root
-        common.log("Trying fallback path: " .. fallback_path)
-        if vim.fn.filereadable(fallback_path) == 1 then
-          local fallback_lines = vim.fn.readfile(fallback_path)
-          if fallback_lines and #fallback_lines > 0 then
-            local common_content_str = table.concat(fallback_lines, "\n")
-            if content ~= "" then
-              content = content .. "\n\n" .. common_content_str
-            else
-              content = common_content_str
-            end
-          else
-            common.log("Could not read common system instructions from fallback or file is empty: " .. fallback_path)
-          end
-        else
-          common.log("Could not find common system instructions at fallback path (not readable): " .. fallback_path)
-        end
-    else
-        common.log("Could not determine current file path for fallback common system instructions.")
-    end
-  end
   return content
+end
+
+local PLAN_RULES = [[
+# Plan Generation Rules
+- Generate a comprehensive, step-by-step technical plan based on the user's request and project context.
+- Identify the exact files to create, modify, or remove and describe the required changes in detail.
+- HARD CONSTRAINT: NEVER output full file contents. Provide only the architectural and implementation plan.
+]]
+
+local REWORD_RULES = [[
+# Prompt Rewording Rules
+- Transform and refine the provided plan output into a detailed, direct prompt continuation for the implementation model.
+- You must enforce that the implementation model provides the full, complete new content of all files to modify or create.
+- HARD CONSTRAINT: Explicitly instruct the implementation model that it must NEVER return diffs, patches, or isolated snippets, but must provide the complete file contents.
+]]
+
+local IMPLEMENT_RULES = [[
+# Implementation Rules
+- Execute the request based on the prompt, plan, and context.
+- Always provide the full, complete revised content of every file to modify or create.
+- HARD CONSTRAINT: NEVER return diffs, git patches, or isolated code chunks. You must output the complete file contents for every file.
+]]
+
+function aiconfig.getPlanInstructions()
+  local user_instructions = aiconfig.getSystemInstructions()
+  if user_instructions and user_instructions ~= "" then
+    return user_instructions .. "\n\n" .. PLAN_RULES
+  end
+  return PLAN_RULES
+end
+
+function aiconfig.getRewordInstructions()
+  return REWORD_RULES
+end
+
+function aiconfig.getImplementInstructions()
+  local user_instructions = aiconfig.getSystemInstructions()
+  if user_instructions and user_instructions ~= "" then
+    return user_instructions .. "\n\n" .. IMPLEMENT_RULES
+  end
+  return IMPLEMENT_RULES
 end
 
 function aiconfig.findScannedFilesConfig()

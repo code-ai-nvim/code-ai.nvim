@@ -36,11 +36,15 @@ For every configured prompt command, the plugin:
 
 1. collects the selected text or command argument
 2. loads system instructions from `.ai-system-instructions.md` when present
-3. optionally appends the bundled system instructions
-4. reads project files listed by `.ai-scanned-files`
-5. decides whether to run in standalone or agent mode
-6. sends the request to each enabled provider
-7. shows the combined result in a floating popup
+3. reads project files listed by `.ai-scanned-files`
+4. decides whether to run in standalone or agent mode
+5. resolves the model pipeline (`plan`, `reword`, `implement`):
+   - **`plan` (optional)**: generates a preliminary high-level plan based on the request and `.ai-scanned-files` (never returns full file contents).
+   - **`reword` (optional)**: refines the plan output into an implementation prompt enforcing full file contents (never diffs or snippets).
+   - If either `plan` or `reword` is unset/nil, the planning stage is skipped.
+   - **`implement` (mandatory)**: produces the complete modified or newly created file contents.
+6. executes the pipeline sequentially and shows live status (`[1/3] Planning`, `[2/3] Rewording plan`, `[3/3] Implementing`) in a floating popup
+7. renders the final result in the floating popup
 
 ### Standalone mode
 
@@ -150,9 +154,11 @@ Example with `lazy.nvim`:
         'nvim-lua/plenary.nvim',
     },
     opts = {
-        anthropic_model = 'claude-sonnet-5',
-        googleai_model = 'gemini-3.5-flash',
-        openai_model = 'gpt-4o-mini',
+        models = {
+            { plan      = 'anthropic/claude-sonnet-5:high' },
+            { implement = 'googleai/gemini-3.5-flash:medium' },
+            { reword    = 'openai/gpt-4o-mini' },
+        },
 
         anthropic_api_key = os.getenv('ANTHROPIC_API_KEY'),
         googleai_api_key = os.getenv('GOOGLEAI_API_KEY'),
@@ -169,7 +175,6 @@ Example with `lazy.nvim`:
         locale = 'en',
         alternate_locale = 'fr',
         result_popup_gets_focus = false,
-        append_embeded_system_instructions = true,
 
         upload_url = '',
         upload_token = '',
@@ -180,34 +185,71 @@ Example with `lazy.nvim`:
         prompts = {
             explain = {
                 command = 'AIExplain',
-                prompt_tpl = [[Explain this code:
-
-${input}]],
+                prompt_tpl = [[Explain this code: ${input}]],
                 result_tpl = '${output}',
                 loading_tpl = 'Loading...',
                 require_input = true,
+                models = {
+                    { plan      = nil },
+                    { implement = 'anthropic/claude-sonnet-5:low' },
+                    { reword    = nil },
+                },
             },
             refactor = {
                 command = 'AIRefactor',
-                prompt_tpl = [[Refactor this code:
-
-${input}]],
+                prompt_tpl = [[Refactor this code: ${input}]],
                 query_mode = 'standalone',
                 require_input = true,
-                anthropic_model = 'claude-sonnet-5:high',
-                googleai_model = 'gemini-3.5-flash:medium',
-                openai_model = 'gpt-4o-mini',
+                models = {
+                    { plan      = 'anthropic/claude-sonnet-5:high' },
+                    { implement = 'googleai/gemini-3.5-flash:medium' },
+                    { reword    = 'openai/gpt-4o-mini' },
+                },
             },
         },
     },
 }
 ```
 
-### Provider configuration
+### Provider and model configuration
 
-- A provider is automatically disabled when its model is unset
-- A provider is also automatically disabled when its model is set but its API key is missing
-- You can explicitly disable a provider by setting its model to `'disabled'`
+Models are configured using the format `<provider>/<model>` (e.g. `anthropic/claude-sonnet-5:high`, `googleai/gemini-3.5-flash:medium`, `openai/gpt-4o-mini`). Supported providers are `anthropic`, `googleai`, and `openai`.
+
+Each prompt (or the global `opts.models` default) defines the model pipeline:
+
+- **`plan` (optional)**: The model used to generate an initial high-level execution plan based on the user request and `.ai-scanned-files`. **Never** outputs full file contents. If `nil` or omitted, the plan step is skipped.
+- **`implement` (mandatory)**: The model that produces the final code. It receives the prompt, reworded plan (if planning occurred), and scanned project files. **Must always** return the full, complete new content of all files to modify or create, and **never** diffs or code snippets.
+- **`reword` (optional)**: The model that refines the output of the `plan` step into a continuation prompt for `implement`, enforcing complete file generation. **If no `reword` model is specified (or set to `nil`), the `plan` step is skipped entirely** and execution proceeds directly to `implement` with the original prompt.
+
+Both array syntax and flat table syntax are supported:
+
+```lua
+-- Array of single-key tables
+models = {
+    { plan      = 'anthropic/claude-sonnet-5:high' },
+    { implement = 'googleai/gemini-3.5-flash:medium' },
+    { reword    = 'openai/gpt-4o-mini' },
+}
+
+-- Or flat table
+models = {
+    plan      = 'anthropic/claude-sonnet-5:high',
+    implement = 'googleai/gemini-3.5-flash:medium',
+    reword    = 'openai/gpt-4o-mini',
+}
+```
+
+To skip planning for a prompt, leave `plan` and `reword` as `nil` (or omit them):
+
+```lua
+models = {
+    { plan      = nil },
+    { implement = 'anthropic/claude-sonnet-5:low' },
+    { reword    = nil },
+}
+```
+
+A prompt without a valid `implement` model or without an API key configured for its referenced provider will abort with an explanatory error popup.
 
 ### Agent configuration
 
@@ -245,9 +287,7 @@ Matched files are deduplicated, sorted by size, and unreadable or empty files ar
 
 ### `.ai-system-instructions.md`
 
-`.ai-system-instructions.md` is optional and is read from the current working directory.
-
-If `append_embeded_system_instructions = true`, its content is followed by the bundled instructions shipped with the plugin.
+`.ai-system-instructions.md` is optional and is read from the current working directory if present. The plugin automatically appends stage-specific guidance for planning, rewording, and implementation steps to ensure each model strictly adheres to output formatting requirements (e.g. planning never provides full files; implementation always provides complete files).
 
 ## Commands
 
@@ -288,9 +328,7 @@ The popup closes automatically when the cursor moves.
 
 | Option | Type | Default | Description |
 | --- | --- | --- | --- |
-| `anthropic_model` | string | `''` | Global Anthropic model. |
-| `googleai_model` | string | `''` | Global GoogleAI model. |
-| `openai_model` | string | `''` | Global OpenAI model. |
+| `models` | table | `{}` | Global default model pipeline (`plan`, `implement`, `reword`). |
 | `anthropic_agent_host` | string | `''` | Anthropic agent base URL. |
 | `googleai_agent_host` | string | `''` | GoogleAI agent base URL. |
 | `openai_agent_host` | string | `''` | OpenAI agent base URL. |
@@ -306,7 +344,6 @@ The popup closes automatically when the cursor moves.
 | `upload_url` | string | `''` | Endpoint used to upload rendered provider output. |
 | `upload_token` | string | `''` | Authentication token used with `upload_url`. |
 | `upload_as_public` | boolean | `false` | Adds the public-upload header when uploading content. |
-| `append_embeded_system_instructions` | boolean | `true` | Append bundled system instructions to `.ai-system-instructions.md`. |
 | `stats_ingestion_token` | string | `''` | Enables provider usage-stat submission when set. |
 | `prompts` | table | built-in `introduce` prompt | Additional prompt definitions merged with built-in prompts. |
 
@@ -321,12 +358,9 @@ These fields are supported inside each entry of `opts.prompts`:
 | `loading_tpl` | No | Popup text shown while waiting for results. |
 | `result_tpl` | No | Template used to render the final combined output. Defaults to `${output}`. |
 | `require_input` | No | Require an argument or visual selection before running. |
-| `anthropic_model` | No | Override the global Anthropic model for this prompt. |
-| `googleai_model` | No | Override the global GoogleAI model for this prompt. |
-| `openai_model` | No | Override the global OpenAI model for this prompt. |
+| `models` | No | Model pipeline definition for this prompt (`plan`, `implement`, `reword`), overriding global `models`. |
 | `query_mode` | No | Force `'standalone'` or `'agent'` for this prompt. |
 | `agent_size_threshold_bytes` | No | Override the global size threshold for this prompt. |
-| `append_embeded_system_instructions` | No | Override the global embedded-instruction toggle for this prompt. |
 
 Per-prompt API keys and per-prompt agent hosts are not supported by the current codebase; only the global options are used for those values.
 
@@ -340,10 +374,10 @@ The plugin replaces these placeholders in templates:
 | `${alternate_locale}` | `prompt_tpl`, `loading_tpl`, `result_tpl` | Value of `opts.alternate_locale`. |
 | `${input}` | `prompt_tpl`, `loading_tpl`, `result_tpl` | Selected text or command argument. |
 | `${input_encoded}` | `prompt_tpl`, `loading_tpl`, `result_tpl` | JSON-encoded form of the input text. |
-| `${output}` | `result_tpl` | Concatenation of all provider outputs. |
-| `${anthropic_output}` | `result_tpl` | Anthropic output only. |
-| `${googleai_output}` | `result_tpl` | GoogleAI output only. |
-| `${openai_output}` | `result_tpl` | OpenAI output only. |
+| `${output}` | `result_tpl` | Final output generated by the implementation model. |
+| `${anthropic_output}` | `result_tpl` | Implementation output when Anthropic is used. |
+| `${googleai_output}` | `result_tpl` | Implementation output when GoogleAI is used. |
+| `${openai_output}` | `result_tpl` | Implementation output when OpenAI is used. |
 
 ## Output and history
 

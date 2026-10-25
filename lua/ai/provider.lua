@@ -63,7 +63,7 @@ function M.createQueryRunner(config)
     if config.validate_data then
       local err_result = config.validate_data(data)
       if err_result then
-        return err_result
+        return err_result, true
       end
     end
 
@@ -72,6 +72,14 @@ function M.createQueryRunner(config)
     local formatted_output_tokens = common.formatTokenCount(output_tokens)
 
     local content_text = config.extract_content(data)
+
+    if opts and opts.raw_output then
+      if opts.stats then
+        common.sendIngestionStats(opts.stats, input_tokens, output_tokens)
+        opts.stats = nil
+      end
+      return content_text, false
+    end
 
     local result = content_text
       .. '\n\n'
@@ -93,7 +101,7 @@ function M.createQueryRunner(config)
       common.log(config.name .. " model is disabled: skipping history save and upload.")
     end
 
-    return result
+    return result, false
   end
 
   function runner.askCallback(res, opts, model_used, prompt_to_save)
@@ -107,6 +115,7 @@ function M.createQueryRunner(config)
         upload_token = opts.upload_token,
         upload_as_public = opts.upload_as_public,
         stats = opts.stats,
+        raw_output = opts.raw_output,
       },
       function(data, upload_url, upload_token, upload_as_public, callback_opts)
         return runner.formatResult(data, upload_url, upload_token, upload_as_public, callback_opts, model_used, prompt_to_save)
@@ -121,7 +130,7 @@ function M.createQueryRunner(config)
     common.log(config.name .. " askHeavy aborted: " .. message)
     if opts.callback ~= nil then
       vim.schedule(function()
-        opts.callback("# Agent Error\n\n" .. message)
+        opts.callback("# Agent Error\n\n" .. message, true)
       end)
     end
   end
@@ -134,7 +143,8 @@ function M.createQueryRunner(config)
           callback = opts.callback,
           upload_url = upload_url,
           upload_token = upload_token,
-          upload_as_public = upload_as_public
+          upload_as_public = upload_as_public,
+          raw_output = opts.raw_output,
         },
         function(res, cb_opts)
           runner.askCallback(res, cb_opts, model, prompt)
@@ -181,6 +191,7 @@ function M.createQueryRunner(config)
         upload_token = upload_token,
         upload_as_public = upload_as_public,
         stats = opts.stats,
+        raw_output = opts.raw_output,
       },
       function(res, cb_opts)
         runner.askCallback(res, cb_opts, model, prompt)
@@ -196,7 +207,8 @@ function M.createQueryRunner(config)
           callback = opts.callback,
           upload_url = upload_url,
           upload_token = upload_token,
-          upload_as_public = upload_as_public
+          upload_as_public = upload_as_public,
+          raw_output = opts.raw_output,
         },
         function(res, cb_opts)
           runner.askCallback(res, cb_opts, model, prompt)
@@ -247,6 +259,7 @@ function M.createQueryRunner(config)
             upload_token = upload_token,
             upload_as_public = upload_as_public,
             stats = opts.stats,
+            raw_output = opts.raw_output,
           }, model, prompt)
         end)
       end

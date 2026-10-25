@@ -17,9 +17,7 @@ local default_prompts = {
 
 local M = {}
 M.opts = {
-  anthropic_model = '',
-  googleai_model = '',
-  openai_model = '',
+  models = {},
 
   anthropic_agent_host = '',
   googleai_agent_host = '',
@@ -40,7 +38,6 @@ M.opts = {
   upload_url = '',
   upload_token = '',
   upload_as_public = false,
-  append_embeded_system_instructions = true,
 
   stats_ingestion_token = '',
 }
@@ -151,8 +148,55 @@ function M.fill(tpl, args)
 end
 
 
+local providers = {
+  anthropic = anthropic,
+  googleai = googleai,
+  openai = openai,
+}
+
+local function queryProviderRunner(parsed_model, instruction, prompt_text, query_opts, scanned_files, heavy, common_opts)
+  local runner_mod = providers[parsed_model.provider]
+  local api_key = M.opts[parsed_model.provider .. '_api_key']
+  local agent_host = M.opts[parsed_model.provider .. '_agent_host']
+  local upload_url = common_opts.upload_url
+  local upload_token = common_opts.upload_token
+  local upload_as_public = common_opts.upload_as_public
+
+  if heavy then
+    runner_mod.askHeavy(
+      parsed_model.model,
+      instruction,
+      prompt_text,
+      query_opts,
+      api_key,
+      agent_host,
+      upload_url,
+      upload_token,
+      upload_as_public,
+      scanned_files
+    )
+  else
+    runner_mod.askLight(
+      parsed_model.model,
+      instruction,
+      prompt_text,
+      query_opts,
+      api_key,
+      upload_url,
+      upload_token,
+      upload_as_public,
+      scanned_files
+    )
+  end
+end
+
 function M.handle(name, input)
   local def = M.prompts[name]
+  if not def then
+    common.log("Command '" .. tostring(name) .. "' not found in prompts configuration.")
+    return
+  end
+
   local width = vim.fn.winwidth(0)
   local height = vim.fn.winheight(0)
   local args = {
@@ -162,7 +206,97 @@ function M.handle(name, input)
     input_encoded = vim.fn.json_encode(input),
   }
 
-  -- Determine the query mode: per-command override or size-based threshold logic
+  -- Resolve models for this prompt
+  local task_models = common.resolveTaskModels(def.models, M.opts.models)
+  local implement_spec = task_models.implement
+  local plan_spec = task_models.plan
+  local reword_spec = task_models.reword
+
+  -- Validate mandatory 'implement' model
+  if not implement_spec or implement_spec == '' then
+    local err_msg = string.format("# Configuration Error\n\nNo 'implement' model configured for command '%s'.", name)
+    common.log(err_msg)
+    local update = M.createPopup(err_msg, width - 8, height - 4)
+    update(err_msg)
+    return
+  end
+
+  local implement_parsed, implement_err = common.parseModelSpec(implement_spec)
+  if not implement_parsed then
+    local err_msg = string.format("# Configuration Error\n\nInvalid 'implement' model for '%s': %s", name, implement_err)
+    common.log(err_msg)
+    local update = M.createPopup(err_msg, width - 8, height - 4)
+    update(err_msg)
+    return
+  end
+
+  local implement_api_key = M.opts[implement_parsed.provider .. '_api_key']
+  if not implement_api_key or implement_api_key == '' then
+    local err_msg = string.format(
+      "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'implement' model '%s'.",
+      implement_parsed.provider, implement_parsed.provider, implement_spec
+    )
+    common.log(err_msg)
+    local update = M.createPopup(err_msg, width - 8, height - 4)
+    update(err_msg)
+    return
+  end
+
+  -- Validate optional 'plan' and 'reword' models
+  -- Both must be present to enable planning; if either is absent/nil/disabled, planning is skipped.
+  local has_planning = false
+  local plan_parsed = nil
+  local reword_parsed = nil
+
+  if plan_spec and reword_spec then
+    local p_parsed, p_err = common.parseModelSpec(plan_spec)
+    if not p_parsed then
+      local err_msg = string.format("# Configuration Error\n\nInvalid 'plan' model for '%s': %s", name, p_err)
+      common.log(err_msg)
+      local update = M.createPopup(err_msg, width - 8, height - 4)
+      update(err_msg)
+      return
+    end
+
+    local r_parsed, r_err = common.parseModelSpec(reword_spec)
+    if not r_parsed then
+      local err_msg = string.format("# Configuration Error\n\nInvalid 'reword' model for '%s': %s", name, r_err)
+      common.log(err_msg)
+      local update = M.createPopup(err_msg, width - 8, height - 4)
+      update(err_msg)
+      return
+    end
+
+    local p_api_key = M.opts[p_parsed.provider .. '_api_key']
+    if not p_api_key or p_api_key == '' then
+      local err_msg = string.format(
+        "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'plan' model '%s'.",
+        p_parsed.provider, p_parsed.provider, plan_spec
+      )
+      common.log(err_msg)
+      local update = M.createPopup(err_msg, width - 8, height - 4)
+      update(err_msg)
+      return
+    end
+
+    local r_api_key = M.opts[r_parsed.provider .. '_api_key']
+    if not r_api_key or r_api_key == '' then
+      local err_msg = string.format(
+        "# Configuration Error\n\nMissing API key for '%s' provider (`%s_api_key`) required by 'reword' model '%s'.",
+        r_parsed.provider, r_parsed.provider, reword_spec
+      )
+      common.log(err_msg)
+      local update = M.createPopup(err_msg, width - 8, height - 4)
+      update(err_msg)
+      return
+    end
+
+    plan_parsed = p_parsed
+    reword_parsed = r_parsed
+    has_planning = true
+  end
+
+  -- Determine query mode (agent vs standalone)
   local query_mode = def.query_mode
   local is_heavy = false
   local scanned_files_list = nil
@@ -193,144 +327,143 @@ function M.handle(name, input)
   end
 
   local show_files_table = (scanned_files_list ~= nil and #scanned_files_list > 0)
-  local update = nil
-  if not show_files_table then
-    update = M.createPopup(M.fill(def.loading_tpl, args), width - 8, height - 4)
-  else
-    local scanned_files = aiconfig.listScannedFilesAsFormattedTable(scanned_files_list)
-    update = M.createPopup(M.fill(def.loading_tpl .. scanned_files, args), width - 8, height - 4)
+  local scanned_files_table = show_files_table and aiconfig.listScannedFilesAsFormattedTable(scanned_files_list) or ""
+
+  local function renderStatus(status_text)
+    local content = status_text
+    if show_files_table then
+      content = content .. "\n\n" .. scanned_files_table
+    end
+    return content
   end
 
-  local prompt = M.fill(def.prompt_tpl, args)
+  local initial_status = has_planning
+    and string.format("[1/3] Planning (%s)...", plan_parsed.full)
+    or string.format("Implementing (%s)...", implement_parsed.full)
 
-  -- Always load system instructions for full conversation parity
-  local append_embeded = M.opts.append_embeded_system_instructions
-  if def.append_embeded_system_instructions ~= nil then
-    append_embeded = def.append_embeded_system_instructions
-  end
-  local instruction = aiconfig.getSystemInstructions(append_embeded)
+  local update = M.createPopup(renderStatus(initial_status), width - 8, height - 4)
+  local original_prompt = M.fill(def.prompt_tpl, args)
 
-  local anthropic_model = def.anthropic_model or M.opts.anthropic_model
-  local googleai_model = def.googleai_model or M.opts.googleai_model
-  local openai_model = def.openai_model or M.opts.openai_model
-
-  -- If command-level models are set, use them
-  if def.anthropic_model and def.anthropic_model ~= '' then
-    anthropic_model = def.anthropic_model
-  end
-  if def.googleai_model and def.googleai_model ~= '' then
-    googleai_model = def.googleai_model
-  end
-  if def.openai_model and def.openai_model ~= '' then
-    openai_model = def.openai_model
-  end
-
-  -- START: Prepare common options for all LLM queries, including upload details
   local common_query_opts = {
     upload_url = M.opts.upload_url,
     upload_token = M.opts.upload_token,
     upload_as_public = M.opts.upload_as_public,
   }
-  -- END: Prepare common options for all LLM queries
 
-  local function handleResult(output, output_key)
-    args[output_key] = output
-    args.output = (args.anthropic_output or '').. (args.googleai_output or '') .. (args.openai_output or '')
-    update(M.fill(def.result_tpl or '${output}', args))
-    return output
-  end
+  -- Step 3: Implement
+  local function executeImplement(final_implement_prompt)
+    if has_planning then
+      update(renderStatus(string.format("[3/3] Implementing (%s)...", implement_parsed.full)))
+    else
+      update(renderStatus(string.format("Implementing (%s)...", implement_parsed.full)))
+    end
 
-  local function createProviderOpts(output_key)
-    return {
-      handleResult = function(output) return handleResult(output, output_key) end,
-      callback = function(res)
-        -- If res is a string starting with # Agent Error, it means askHeavy failed during chunk transmission
-        -- before reaching the final LLM prompt logic. We propagate it to the UI here.
-        if type(res) == 'string' and string.sub(res, 1, 13) == "# Agent Error" then
-          handleResult(res, output_key)
+    local query_opts = {
+      raw_output = false,
+      handleResult = function(output)
+        args.output = output
+        args[implement_parsed.provider .. '_output'] = output
+        update(M.fill(def.result_tpl or '${output}', args))
+        return output
+      end,
+      callback = function(res, is_error)
+        if is_error or (type(res) == 'string' and string.sub(res, 1, 13) == "# Agent Error") then
+          update(res)
         end
       end,
       upload_url = common_query_opts.upload_url,
       upload_token = common_query_opts.upload_token,
       upload_as_public = common_query_opts.upload_as_public,
     }
+
+    queryProviderRunner(
+      implement_parsed,
+      aiconfig.getImplementInstructions(),
+      final_implement_prompt,
+      query_opts,
+      scanned_files_list,
+      is_heavy,
+      common_query_opts
+    )
   end
 
-  local askHandleResultAndCallbackAnthropic = createProviderOpts('anthropic_output')
-  local askHandleResultAndCallbackGoogleAI = createProviderOpts('googleai_output')
-  local askHandleResultAndCallbackOpenAI = createProviderOpts('openai_output')
+  -- Step 2: Reword (only when has_planning is true)
+  local function executeReword(plan_text)
+    update(renderStatus(string.format("[2/3] Rewording plan (%s)...", reword_parsed.full)))
 
-  if not is_heavy then
-    anthropic.askLight(
-      anthropic_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackAnthropic,
-      M.opts.anthropic_api_key,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
+    local reword_prompt = string.format(
+      "Original user request:\n%s\n\nPlan to execute:\n%s\n\n" ..
+      "Refine the plan above into a direct continuation prompt for the implementation model. " ..
+      "Enforce that the implementation model must provide the full, complete new content of all files to modify or create, and never return diffs or code snippets.",
+      original_prompt,
+      plan_text
     )
-    googleai.askLight(
-      googleai_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackGoogleAI,
-      M.opts.googleai_api_key,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
+
+    local query_opts = {
+      raw_output = true,
+      handleResult = function(output) return output end,
+      callback = function(res, is_error)
+        if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
+          common.log("Error during Reword step: " .. tostring(res))
+          update("# Error during Reword step\n\n" .. tostring(res))
+          return
+        end
+
+        local combined_implement_prompt = original_prompt .. "\n\n### Implementation Plan & Instructions:\n" .. res
+        executeImplement(combined_implement_prompt)
+      end,
+      upload_url = common_query_opts.upload_url,
+      upload_token = common_query_opts.upload_token,
+      upload_as_public = common_query_opts.upload_as_public,
+    }
+
+    queryProviderRunner(
+      reword_parsed,
+      aiconfig.getRewordInstructions(),
+      reword_prompt,
+      query_opts,
+      nil,
+      false,
+      common_query_opts
     )
-    openai.askLight(
-      openai_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackOpenAI,
-      M.opts.openai_api_key,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
+  end
+
+  -- Step 1: Plan (only when has_planning is true)
+  local function executePlan()
+    update(renderStatus(string.format("[1/3] Planning (%s)...", plan_parsed.full)))
+
+    local query_opts = {
+      raw_output = true,
+      handleResult = function(output) return output end,
+      callback = function(res, is_error)
+        if is_error or (type(res) == 'string' and (string.sub(res, 1, 13) == "# Agent Error" or string.sub(res, 1, 6) == "Error:")) then
+          common.log("Error during Plan step: " .. tostring(res))
+          update("# Error during Plan step\n\n" .. tostring(res))
+          return
+        end
+
+        executeReword(res)
+      end,
+      upload_url = common_query_opts.upload_url,
+      upload_token = common_query_opts.upload_token,
+      upload_as_public = common_query_opts.upload_as_public,
+    }
+
+    queryProviderRunner(
+      plan_parsed,
+      aiconfig.getPlanInstructions(),
+      original_prompt,
+      query_opts,
+      scanned_files_list,
+      is_heavy,
+      common_query_opts
     )
+  end
+
+  if has_planning then
+    executePlan()
   else
-    anthropic.askHeavy(
-      anthropic_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackAnthropic,
-      M.opts.anthropic_api_key,
-      M.opts.anthropic_agent_host,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
-    )
-    googleai.askHeavy(
-      googleai_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackGoogleAI,
-      M.opts.googleai_api_key,
-      M.opts.googleai_agent_host,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
-    )
-    openai.askHeavy(
-      openai_model,
-      instruction,
-      prompt,
-      askHandleResultAndCallbackOpenAI,
-      M.opts.openai_api_key,
-      M.opts.openai_agent_host,
-      common_query_opts.upload_url,
-      common_query_opts.upload_token,
-      common_query_opts.upload_as_public,
-      scanned_files_list
-    )
+    executeImplement(original_prompt)
   end
 end
 
@@ -375,24 +508,28 @@ function M.setup(opts)
     end
   end
 
-  local providers = {
-    { name = 'anthropic', model_key = 'anthropic_model', api_key_key = 'anthropic_api_key' },
-    { name = 'googleai', model_key = 'googleai_model', api_key_key = 'googleai_api_key' },
-    { name = 'openai', model_key = 'openai_model', api_key_key = 'openai_api_key' },
-  }
-  for _, provider in ipairs(providers) do
-    local model = M.opts[provider.model_key]
-    local api_key = M.opts[provider.api_key_key]
-    local model_missing = (model == nil or model == '')
-    local model_disabled = (model == 'disabled')
-    local api_key_missing = (api_key == nil or api_key == '')
+  -- Check provider API keys for any models configured globally or per-prompt
+  local referenced_providers = {}
+  local function collectProviders(models_def)
+    if type(models_def) ~= 'table' then return end
+    local task_models = common.resolveTaskModels(models_def, nil)
+    for _, spec in pairs(task_models) do
+      local parsed = common.parseModelSpec(spec)
+      if parsed then
+        referenced_providers[parsed.provider] = true
+      end
+    end
+  end
 
-    if model_missing then
-      M.opts[provider.model_key] = 'disabled'
-      common.log(provider.name .. " model is not configured and has been disabled.")
-    elseif not model_disabled and api_key_missing then
-      M.opts[provider.model_key] = 'disabled'
-      common.log(provider.name .. " API key is not configured; provider has been disabled.")
+  collectProviders(M.opts.models)
+  for _, prompt_def in pairs(M.prompts) do
+    collectProviders(prompt_def.models)
+  end
+
+  for provider, _ in pairs(referenced_providers) do
+    local api_key = M.opts[provider .. '_api_key']
+    if api_key == nil or api_key == '' then
+      common.log(provider .. " API key is not configured; calls using this provider will fail.")
     end
   end
 
