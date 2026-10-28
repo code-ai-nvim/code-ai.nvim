@@ -520,7 +520,9 @@ function M.handle(name, input)
     local reword_prompt = string.format(
       "Original user request:\n%s\n\nPlan to execute:\n%s\n\n" ..
       "Refine the plan above into a direct continuation prompt for the implementation model. " ..
-      "Enforce that the implementation model must provide the full, complete new content of all files to modify or create, and never return diffs or code snippets.",
+      "Enforce that the implementation model must provide the full, " .. 
+      "complete new content of all files to modify or create, and never return diffs or code snippets." .. 
+      "Answer directly with the reworded prompt, without any additional commentary or explanation.",
       original_prompt,
       plan_text
     )
