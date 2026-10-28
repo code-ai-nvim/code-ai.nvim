@@ -518,11 +518,12 @@ function M.handle(name, input)
     update(render_status(string.format("[2/3] Rewording plan (%s)...", reword_parsed.full)))
 
     local reword_prompt = string.format(
-      "Original user request:\n%s\n\nPlan to execute:\n%s\n\n" ..
-      "Refine the plan above into a direct continuation prompt for the implementation model. " ..
+      "Initial user prompt:\n%s\n\nPlan to execute:\n%s\n\n" ..
+      "Concatenate the initial prompt and the plan above into a single document for the implementation model. " ..
+      "Slightly reword sentences to make the documents flow better, but do not change the meaning of any sentence. " ..
       "Enforce that the implementation model must provide the full, " .. 
-      "complete new content of all files to modify or create, and never return diffs or code snippets." .. 
-      "Answer directly with the reworded prompt, without any additional commentary or explanation.",
+      "complete new content of all files to modify or create, and never return diffs or partial files." .. 
+      "Answer directly with the reworded prompt + plan content, without any additional commentary or explanation.",
       original_prompt,
       plan_text
     )
