@@ -2,6 +2,7 @@ local anthropic = require('ai.anthropic.query')
 local googleai = require('ai.googleai.query')
 local openai = require('ai.openai.query')
 local ollama_reword = require('ai.ollama.reword')
+local ollama_query = require('ai.ollama.query')
 local aiconfig = require('ai.aiconfig')
 local common = require('ai.common')
 
@@ -235,6 +236,30 @@ local function resolve_model(role, spec, prompt_name, requirements)
   return parsed
 end
 
+-- Build the descriptor of the local (Ollama) reword model from the plugin
+-- options. Returns the descriptor, or nil and an error message.
+local function resolve_local_reword_model(name)
+  if is_empty(M.opts.ollama_host) then
+    return nil, string.format("Reword model for '%s' is 'local' but `ollama_host` is not configured.", name)
+  end
+  if is_empty(M.opts.ollama_model) then
+    return nil, string.format("Reword model for '%s' is 'local' but `ollama_model` is not configured.", name)
+  end
+  return {
+    provider = 'ollama',
+    model = M.opts.ollama_model,
+    full = 'local (ollama/' .. M.opts.ollama_model .. ')',
+    is_local = true,
+  }
+end
+
+local function show_local_only_for_reword(name, task)
+  show_config_error(string.format(
+    "'local' is only supported for the 'reword' model (command '%s', task '%s').",
+    name, task
+  ))
+end
+
 -- Resolve and validate the models of a prompt. On failure the error is shown
 -- and nil is returned. Planning is enabled only when both 'plan' and 'reword'
 -- models are configured.
@@ -244,6 +269,11 @@ local function resolve_pipeline_models(name, def)
   local implement_spec = task_models.implement
   if not implement_spec or implement_spec == '' then
     show_config_error(string.format("No 'implement' model configured for command '%s'.", name))
+    return nil
+  end
+
+  if common.isLocalModelSpec(implement_spec) then
+    show_local_only_for_reword(name, 'implement')
     return nil
   end
 
@@ -258,29 +288,45 @@ local function resolve_pipeline_models(name, def)
   local plan_spec = task_models.plan
   local reword_spec = task_models.reword
   if plan_spec and reword_spec then
+    if common.isLocalModelSpec(plan_spec) then
+      show_local_only_for_reword(name, 'plan')
+      return nil
+    end
+
+    local reword_is_local = common.isLocalModelSpec(reword_spec)
+
     -- Phase 1: parse both specs.
     local plan, plan_err = parse_model('plan', plan_spec, name)
     if not plan then
       show_config_error(plan_err)
       return nil
     end
-    local reword, reword_err = parse_model('reword', reword_spec, name)
+
+    local reword, reword_err
+    if reword_is_local then
+      reword, reword_err = resolve_local_reword_model(name)
+    else
+      reword, reword_err = parse_model('reword', reword_spec, name)
+    end
     if not reword then
       show_config_error(reword_err)
       return nil
     end
 
     -- Phase 2: credentials. 'plan' runs through the agent; 'reword' uses
-    -- askLight (direct API call), so it needs no agent host.
+    -- askLight (direct API call), so it needs no agent host. A local reword
+    -- needs no API key at all.
     local ok, cred_err = check_credentials('plan', plan_spec, plan, { agent_host = true })
     if not ok then
       show_config_error(cred_err)
       return nil
     end
-    ok, cred_err = check_credentials('reword', reword_spec, reword, { agent_host = false })
-    if not ok then
-      show_config_error(cred_err)
-      return nil
+    if not reword_is_local then
+      ok, cred_err = check_credentials('reword', reword_spec, reword, { agent_host = false })
+      if not ok then
+        show_config_error(cred_err)
+        return nil
+      end
     end
 
     result.plan = plan
@@ -296,10 +342,22 @@ end
 -- run = { parsed, instruction, prompt, query_opts, scanned_files, heavy }
 local function run_provider_query(run)
   local parsed = run.parsed
+  local query_opts = run.query_opts
+
+  -- Local (Ollama) models: light calls only.
+  if parsed.is_local or parsed.provider == 'ollama' then
+    if run.heavy then
+      common.log("[Pipeline] Local (Ollama) models cannot be used for heavy/agent steps.")
+      query_opts.callback("# Configuration Error\n\nLocal (Ollama) models cannot be used for heavy/agent steps.", true)
+      return
+    end
+    ollama_query.askLight(parsed.model, run.instruction, run.prompt, query_opts, M.opts.ollama_host)
+    return
+  end
+
   local runner_mod = providers[parsed.provider]
   local api_key = M.opts[parsed.provider .. '_api_key']
   local agent_host = M.opts[parsed.provider .. '_agent_host']
-  local query_opts = run.query_opts
 
   if run.heavy then
     runner_mod.askHeavy(
@@ -468,6 +526,9 @@ function M.handle(name, input)
     )
 
     common.log(string.format("[Pipeline] === [2/3] Executing Reword (%s) ===", reword_parsed.full))
+    if reword_parsed.is_local then
+      common.log(string.format("[Pipeline] Reword runs locally on Ollama at %s", tostring(M.opts.ollama_host)))
+    end
     common.log(string.format("[Pipeline] Plan received to reword:\n%s", plan_text))
     common.log(string.format("[Pipeline] Reword prompt:\n%s", reword_prompt))
 
@@ -588,20 +649,30 @@ local function register_prompt_commands()
 end
 
 -- Log a warning for every referenced provider that lacks an API key, and for
--- every plan/implement provider that lacks an agent host.
+-- every plan/implement provider that lacks an agent host. Also warn about
+-- misuse of the 'local' spec and an unconfigured local reword.
 local function warn_about_missing_credentials()
   local referenced_providers = {}
   local agent_providers = {}
+  local uses_local_reword = false
 
   local function collect_providers(models_def)
     if type(models_def) ~= 'table' then return end
     local task_models = common.resolveTaskModels(models_def, nil)
     for task, spec in pairs(task_models) do
-      local parsed = common.parseModelSpec(spec)
-      if parsed then
-        referenced_providers[parsed.provider] = true
-        if task == 'plan' or task == 'implement' then
-          agent_providers[parsed.provider] = true
+      if common.isLocalModelSpec(spec) then
+        if task == 'reword' then
+          uses_local_reword = true
+        else
+          common.log(string.format("Warning: 'local' is only supported for the 'reword' task (found for '%s').", task))
+        end
+      else
+        local parsed = common.parseModelSpec(spec)
+        if parsed then
+          referenced_providers[parsed.provider] = true
+          if task == 'plan' or task == 'implement' then
+            agent_providers[parsed.provider] = true
+          end
         end
       end
     end
@@ -624,6 +695,10 @@ local function warn_about_missing_credentials()
     if agent_host == nil or agent_host == '' then
       common.log("Warning: " .. provider .. " agent host (" .. provider .. "_agent_host) is not configured; plan/implement calls using this provider will fail.")
     end
+  end
+
+  if uses_local_reword and (is_empty(M.opts.ollama_host) or is_empty(M.opts.ollama_model)) then
+    common.log("Warning: reword is set to 'local' but ollama_host/ollama_model is not configured; rewording will fail.")
   end
 end
 
@@ -661,3 +736,4 @@ vim.api.nvim_create_autocmd({ 'CursorMoved', 'CursorMovedI' }, {
 })
 
 return M
+

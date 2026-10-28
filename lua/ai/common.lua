@@ -16,9 +16,13 @@ local STATS_INGESTION_URL = "https://token-loc-size.m-rktmb.ovh/inject.php"
 local UPLOAD_TIMEOUT_MS = 500000
 local AGENT_CHUNK_TIMEOUT_MS = 30000
 local AGENT_ERROR_PREFIX = "# Agent Error"
+local LOCAL_MODEL_SPEC = 'local'
 
 --- Prefix used for every error string produced by the agent transport layer.
 common.AGENT_ERROR_PREFIX = AGENT_ERROR_PREFIX
+
+--- Model spec meaning "use the local Ollama settings" (only valid for 'reword').
+common.LOCAL_MODEL_SPEC = LOCAL_MODEL_SPEC
 
 -- ===== Logging =====
 
@@ -61,6 +65,13 @@ function common.splitModelSuffix(model)
     return base, suffix
   end
   return model, nil
+end
+
+--- True when `spec` is the 'local' model spec (case- and whitespace-insensitive).
+---@param spec any
+---@return boolean
+function common.isLocalModelSpec(spec)
+  return type(spec) == 'string' and vim.trim(spec):lower() == LOCAL_MODEL_SPEC
 end
 
 --- Parse a model spec in '<provider>/<model>' format (e.g. 'anthropic/claude-sonnet-5:high').
@@ -560,3 +571,4 @@ function common.askHeavy(agent_host, api_key, model, instruction, prompt, projec
 end
 
 return common
+

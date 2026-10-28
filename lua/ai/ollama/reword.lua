@@ -1,5 +1,5 @@
-local curl = require('plenary.curl')
 local common = require('ai.common')
+local client = require('ai.ollama.client')
 
 local reword = {}
 
@@ -13,13 +13,6 @@ local SYSTEM_MESSAGE = [[
     You do not try to execute the prompt, you only reword it to make it more clear and detailed.
     ]]
 
-local function normalize_host(host)
-  if vim.endswith(host, "/") then
-    return host:sub(1, -2)
-  end
-  return host
-end
-
 -- Priming conversation that leads the model to reword `prompt`.
 local function build_messages(prompt)
   return {
@@ -30,23 +23,6 @@ local function build_messages(prompt)
     { role = "assistant", content = "What exactly do you want me to do?" },
     { role = "user", content = "I want you to reword the prompt." }
   }
-end
-
-local function handle_response(res, callback)
-  if res.status ~= 200 then
-    common.log("Ollama API error status: " .. tostring(res.status))
-    callback("# Ollama API Error (" .. tostring(res.status) .. ")\n\n" .. (res.body or "No response body"))
-    return
-  end
-
-  local success, data = pcall(vim.fn.json_decode, res.body)
-  if not success or not data or not data.message or not data.message.content then
-    common.log("Failed to decode Ollama JSON response: " .. (res.body or "Empty body"))
-    callback("# Ollama Error\n\nFailed to parse JSON response from Ollama server.")
-    return
-  end
-
-  callback(data.message.content)
 end
 
 ---@param prompt string
@@ -62,26 +38,12 @@ function reword.reword(prompt, opts, callback)
     return
   end
 
-  local url = normalize_host(host) .. "/api/chat"
-  local payload = {
-    model = model,
-    stream = false,
-    messages = build_messages(prompt),
-  }
+  common.log("Sending prompt rewording request to Ollama server at " .. client.normalize_host(host) .. "/api/chat")
 
-  common.log("Sending prompt rewording request to Ollama server at " .. url)
-
-  curl.post(url, {
-    headers = {
-      ["Content-Type"] = "application/json"
-    },
-    body = vim.fn.json_encode(payload),
-    callback = function(res)
-      vim.schedule(function()
-        handle_response(res, callback)
-      end)
-    end
-  })
+  client.chat(host, model, build_messages(prompt), function(text, _)
+    callback(text)
+  end)
 end
 
 return reword
+
