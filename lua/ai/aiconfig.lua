@@ -14,15 +14,16 @@ local PLAN_RULES = [[
 ]]
 
 local REWORD_RULES = [[
-# Prompt Rewording Rules
-- Transform and refine the provided plan output into a detailed, direct prompt continuation for the implementation model.
-- You must enforce that the implementation model provides the full, complete new content of all files to modify or create.
+# Prompt + Plan Rewording Rules
+- Merge the Prompt and the plan refine them into adirect prompt to be provided to the implementation model.
+- You must enforce  the instruction that the implementation model must provide the full, complete new content of all files to modify or create.
+- Answer with the merged and reworded prompt only, without any additional introduction, commentary, or explanation.
 - HARD CONSTRAINT: Explicitly instruct the implementation model that it must NEVER return diffs, patches, or isolated snippets, but must provide the complete file contents.
 ]]
 
 local IMPLEMENT_RULES = [[
 # Implementation Rules
-- Execute the request based on the prompt, plan, and context.
+- Execute the request based on the provided prompt, plan, and context.
 - Always provide the full, complete revised content of every file to modify or create.
 - HARD CONSTRAINT: NEVER return diffs, git patches, or isolated code chunks. You must output the complete file contents for every file.
 ]]
